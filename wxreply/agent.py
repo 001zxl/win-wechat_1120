@@ -193,6 +193,7 @@ class Agent:
         self._event_state: Dict[str, Dict[str, Any]] = {}
         self._product_ctx: Dict[str, Dict[str, Any]] = {}   # 每个会话最近确认过的产品/型号
         self._media_asked: Dict[str, set] = {}          # 已经追问过的图片，避免反复刷同一句
+        self._ask_state: Dict[str, Dict[str, Any]] = {}  # 追问计数：问两次还问不出来就转人工
         self._vision_cache: Dict[str, str] = {}         # 图片路径 → 视觉描述（避免重复调模型）
         self._deep_page: Optional[int] = None
         self._last_error: str = ""
@@ -1901,6 +1902,7 @@ class Agent:
                 self.emit("tool", name=result.name, summary=result.summary, ok=result.ok)
             verdict = self._media_verdict(peer, items) or evidence_decide(
                 joined, evidence, product_hint=query, ambiguous_product=ambiguous)
+            verdict = self._repeat_ask(peer, verdict, joined)
             if verdict.action == "handoff":
                 self.handoff.take(peer, verdict.reason or "没有可靠依据")
                 # 同一批消息的旧草稿也必须作废：否则人工批准还能把"没依据的答案"发出去
@@ -2126,12 +2128,30 @@ class Agent:
                 self._product_ctx[peer] = {"sku": str(data["sku"]),
                                            "name": str(data.get("name") or ""),
                                            "ts": time.time()}
+                self._ask_state.pop(peer, None)
                 return
         item = self.tools.match_product(text)
         if item:
             self._product_ctx[peer] = {"sku": str(item.get("sku") or ""),
                                        "name": str(item.get("name") or ""),
                                        "ts": time.time()}
+            self._ask_state.pop(peer, None)
+
+    def _repeat_ask(self, peer: str, verdict: Verdict, joined: str) -> Verdict:
+        """同一个会话连续追问两次还问不出字段，就不要再问了，转人工。"""
+        if verdict.action != "ask":
+            return verdict
+        signature = normalize_name(joined)
+        state = self._ask_state.setdefault(peer, {})
+        if state.get("signature") == signature and state.get("ask") == verdict.ask:
+            return verdict                      # 同一批消息重复判定，不重复计数
+        count = int(state.get("count") or 0) + 1 if state.get("ask") == verdict.ask else 1
+        state.update({"signature": signature, "ask": verdict.ask, "count": count})
+        if count > 2:
+            return Verdict("handoff", verdict.categories,
+                           verdict.missing or [verdict.ask or "ask"],
+                           "同一问题追问两次仍没补齐信息，转人工")
+        return verdict
 
     def _media_verdict(self, peer: str, items: List[MessageItem]) -> Optional[Verdict]:
         """图片读不出来时的确定出口：先追问一次，同一张图还读不出来就转人工。"""

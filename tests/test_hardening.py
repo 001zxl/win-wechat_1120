@@ -147,6 +147,26 @@ class TestFactCoverage(unittest.TestCase):
         self.assertTrue(draft["knowledge"]["sources"], "草稿必须记录用了哪些知识片段")
         agent.close()
 
+    def test_repeated_missing_field_escalates(self) -> None:
+        """连续追问两次还问不出型号，就不再追问，转人工。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            agent, platform = build(tmp, ["这个多少钱"])
+            respond(agent, platform)
+            self.assertIn("张三", agent._pending, "第一次缺型号应追问")
+            self.assertIn("哪一款", agent._pending["张三"]["reply"])
+
+            platform.sessions[0].messages.append(
+                {"dir": "in", "kind": "text", "text": "就这个，多少钱"})
+            respond(agent, platform)
+            self.assertEqual(agent._pending["张三"]["verdict"]["action"], "ask")
+
+            platform.sessions[0].messages.append(
+                {"dir": "in", "kind": "text", "text": "还是这个"})
+            respond(agent, platform)
+            self.assertNotIn("张三", agent._pending, "第三次不应再追问")
+            self.assertTrue(agent.handoff.is_taken("张三"))
+            agent.close()
+
     def test_invented_number_in_reply_blocks(self) -> None:
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             agent, platform = build(tmp, ["可以送到西藏吗"], kb=True)

@@ -186,7 +186,7 @@ X-Tenant-ID: <空间 ID>                       # 平台级 key 必填；空间�
 8. **多轮指代进检索**：记住本会话确认过的型号，`这个多少钱` 这类指代会把历史型号拼进检索 query；出现多个型号时先追问，不再"有知识却反复转人工"。
 9. **凭据撤销**：设置面板每个模型都有「删除」，另有「撤销全部凭据」；留空 = 删除（不再等于"不修改"），撤销后立即变为未就绪、且不会从顶层 `ai.api_key` 继承回来；控制台令牌被撤销后不再接受。
 
-配套：`kb/` 按 Markdown 标题切块（避免整份 FAQ 变成一块、"任意片段"命中所有主题）；`data/price_list.json` 缺省用 `price_list.example.json` 复制；新增 `tests/test_hardening.py`（37 项）覆盖以上 9 条；逐项说明与未验证项见 [docs/复查记录-v0.6.md](docs/复查记录-v0.6.md)。
+配套：`kb/` 按 Markdown 标题切块（避免整份 FAQ 变成一块、"任意片段"命中所有主题）；`data/price_list.json` 缺省用 `price_list.example.json` 复制；新增 `tests/test_hardening.py`（38 项）覆盖以上 9 条；逐项说明与未验证项见 [docs/复查记录-v0.6.md](docs/复查记录-v0.6.md)。
 
 ## v0.5 正式自动发送前的整改
 
