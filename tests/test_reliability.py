@@ -459,6 +459,191 @@ class TestRepeatProcessing(unittest.TestCase):
             agent.close()
 
 
+class TestRetryAndRateLimit(unittest.TestCase):
+    def test_model_failure_is_retried_later(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            calls = {"n": 0}
+
+            def flaky(*_a, **_k):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return (None, "fake", 0)      # 第一次模拟 503
+                return ("在的", "fake", 1)
+
+            agent._generate = flaky
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            self.assertFalse(agent._respond("张三", items, image, regions, False))
+            state = agent._event_state["张三"]
+            self.assertEqual(state["status"], "retry")
+            self.assertNotIn("张三", agent._pending, "失败时不应留下可发送的草稿")
+
+            state["next_at"] = 0                 # 模拟冷却到期
+            agent.drive_pending_work()
+            self.assertEqual(calls["n"], 2, "恢复后应自动重试同一条消息")
+            self.assertIn("张三", agent._pending)
+            agent.close()
+
+    def test_rate_limited_draft_is_flushed_later(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            agent.set_dry_run(False)
+            agent.router.client.config.api_key = "sk-test"
+            agent._generate = lambda *a, **k: ("在的", "fake", 1)
+            agent.limiter.allowed = lambda peer: False        # 限频中
+
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            agent._respond("张三", items, image, regions, False)
+            self.assertTrue(agent._pending["张三"].get("held_reason"))
+            self.assertEqual(platform.sent, [])
+
+            agent.limiter.allowed = lambda peer: True         # 冷却结束
+            agent._flush_held()
+            self.assertEqual(len(platform.sent), 1, "冷却结束后应补发暂存的草稿")
+            self.assertNotIn("张三", agent._pending)
+            agent.close()
+
+
+class TestInputBoxGuard(unittest.TestCase):
+    def test_existing_input_text_blocks_send(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.runtime.dry_run = False
+            platform = MockPlatform()
+            platform.current = 0
+            platform.draft = "这句内部备注还没有确认，不要发："
+            image = platform.capture()
+            sender = SafeSender(platform, cfg, Whitelist(cfg.safety.whitelist), None)
+            result = sender.send("张三", "按一个为您处理", image, regions_for(platform))
+            self.assertEqual(result.outcome.detail, "input_not_empty")
+            self.assertEqual(platform.sent, [], "输入框有内容时不能发送")
+
+
+class TestTakeoverDuringWait(unittest.TestCase):
+    def test_cancel_while_waiting(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.runtime.dry_run = False
+            platform = MockPlatform()
+            platform.current = 0
+            image = platform.capture()
+            sender = SafeSender(platform, cfg, Whitelist(cfg.safety.whitelist), None)
+            sender.risk.plan = lambda peer, text: (1.2, "ok")
+            calls = {"n": 0}
+
+            def guard():
+                calls["n"] += 1
+                return "manual_takeover" if calls["n"] >= 2 else None
+
+            result = sender.send("张三", "按一个为您处理", image, regions_for(platform), guard=guard)
+            self.assertEqual(result.outcome.status, "aborted")
+            self.assertEqual(result.outcome.detail, "manual_takeover")
+            self.assertEqual(platform.sent, [])
+
+
+class TestConvergenceLimit(unittest.TestCase):
+    def test_still_changing_customer_blocks_send(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            texts = ["我要一个", "改成两个", "改成三个", "改成四个"]
+            calls = {"n": 0}
+
+            def generate(*_a, **_k):
+                calls["n"] += 1
+                if calls["n"] < len(texts):
+                    platform.sessions[0].messages.append(
+                        {"dir": "in", "kind": "text", "text": texts[calls["n"]]})
+                return ("按本轮看到的需求处理：%s" % texts[calls["n"] - 1], "fake", 1)
+
+            agent._generate = generate
+            platform.sessions[0].messages = [{"dir": "in", "kind": "text", "text": texts[0]}]
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            agent._respond("张三", items, image, regions, False)
+            self.assertNotIn("张三", agent._pending, "客户仍在改口时不能发送旧答案")
+            self.assertEqual(agent._event_state["张三"]["status"], "retry")
+            agent.close()
+
+
+class TestMultilineBubble(unittest.TestCase):
+    def test_two_line_reply_is_recognized(self) -> None:
+        class StubLine:
+            def __init__(self, text, bbox):
+                self.text = text
+                self.bbox = bbox
+                self.score = 0.95
+
+        class StubOcr:
+            available = True
+
+            def __init__(self, sequence):
+                self.sequence = list(sequence)
+
+            def recognize(self, _crop):
+                return self.sequence.pop(0) if self.sequence else []
+
+        class FakeImage:
+            width = 1160
+            height = 760
+
+            def crop(self, _box):
+                return self
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            old = [StubLine("好的", (600, 100, 700, 120))]
+            new = [StubLine("您好，产品目前有货，", (600, 100, 760, 120)),
+                   StubLine("请问您需要多少个？", (600, 126, 760, 146))]
+            stub = StubOcr([old, old + new, old, old + new])
+            sender = SafeSender(MockPlatform(), cfg, Whitelist(cfg.safety.whitelist), stub)
+            regions = LayoutCalculator().regions(FakeImage.width, FakeImage.height)
+            ok = sender._verify_new_bubble(FakeImage(), FakeImage(), regions,
+                                           "您好，产品目前有货，请问您需要多少个？")
+            self.assertTrue(ok, "同一气泡的多行文字应先合并再比较")
+
+
+class TestApproveWithOtherChatOpen(unittest.TestCase):
+    def test_approve_switches_back_before_version_check(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            agent._generate = lambda *a, **k: ("按一个处理", "fake", 1)
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            agent._respond("张三", items, image, regions, False)
+
+            agent.set_dry_run(False)
+            agent.router.client.config.api_key = "sk-test"
+            platform.current = 1          # 微信当前打开的是李四
+
+            def fake_open(peer):
+                platform.current = 0
+                return True
+
+            agent.open_conversation = fake_open
+            result = agent.approve_pending(peer="张三")
+            self.assertNotEqual(result["status"], "blocked", result)
+            self.assertEqual(result["status"], "verified", result)
+            agent.close()
+
+
 class TestSecurityAndNaming(unittest.TestCase):
     def test_static_path_traversal_blocked(self) -> None:
         self.assertIsNone(resolve_static_path(WEB_DIR, "../config.example.yaml"))

@@ -88,12 +88,12 @@ class SafeSender:
             return ""
 
     # ---------- 发送主流程 ----------
-    def send(self, peer: str, text: str, pre_image, regions: Regions) -> SendResult:
+    def send(self, peer: str, text: str, pre_image, regions: Regions, guard=None) -> SendResult:
         # 串行化：自动扫描 / 控制台点击 / 人工操作共用同一把锁
         with self.lock:
-            return self._send_locked(peer, text, pre_image, regions)
+            return self._send_locked(peer, text, pre_image, regions, guard)
 
-    def _send_locked(self, peer: str, text: str, pre_image, regions: Regions) -> SendResult:
+    def _send_locked(self, peer: str, text: str, pre_image, regions: Regions, guard=None) -> SendResult:
         runtime = self.config.runtime
         safety = self.config.safety
         if getattr(self.platform, "passive", False):
@@ -131,8 +131,17 @@ class SafeSender:
             wait_s, reason = self.risk.plan(peer, text)
             if wait_s is None:
                 return SendResult(SendOutcome("aborted", "risk_limit"), header=header)
-            if wait_s > 0:
-                time.sleep(wait_s)
+            # 等待期间可被取消：转人工 / 客户改了需求都不应该再发出去
+            deadline = time.time() + max(0.0, wait_s)
+            while True:
+                if guard is not None:
+                    abort_reason = guard()
+                    if abort_reason:
+                        return SendResult(SendOutcome("aborted", abort_reason), header=header)
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.5, remaining))
 
         attempts = max(1, int(runtime.send_retries) + 1)
         last = SendResult(SendOutcome("uncertain", "no_attempt"), header=header)
@@ -163,6 +172,18 @@ class SafeSender:
             if safety.require_header_match and not is_same_peer_strict(header_now, peer):
                 self.platform.restore_foreground(original_foreground)
                 return SendResult(SendOutcome("aborted", ABORT_HEADER_CHANGED), header=header_now)
+
+            # 输入框里已经有人写了一半的内容（人工备注/草稿）：绝不清空、绝不混发
+            if self._input_has_text(check, regions):
+                self.platform.restore_foreground(original_foreground)
+                return SendResult(SendOutcome("aborted", "input_not_empty"), header=header_now)
+
+            # 粘贴前最后一次取消点：转人工 / 客户又改口
+            if guard is not None:
+                abort_reason = guard()
+                if abort_reason:
+                    self.platform.restore_foreground(original_foreground)
+                    return SendResult(SendOutcome("aborted", abort_reason), header=header_now)
 
             try:
                 input_x = regions.input[0] + max(40, (regions.input[2] - regions.input[0]) * 0.2)
@@ -212,7 +233,7 @@ class SafeSender:
         return last
 
     # ---------- 验收：只认本次新增、内容相符的我方气泡 ----------
-    def _outgoing_texts(self, image, regions: Regions):
+    def _outgoing_lines(self, image, regions: Regions):
         if self.ocr is None or not self.ocr.available:
             return []
         try:
@@ -224,23 +245,60 @@ class SafeSender:
         width = max(1, regions.chat[2] - chat_left)
         rows = []
         for line in lines:
-            x1, y1, x2, _y2 = line.bbox
+            x1, y1, x2, y2 = line.bbox
             global_x1 = x1 + offset_x
             center = (global_x1 + (x2 + offset_x)) / 2.0
             if (center - chat_left) / width >= 0.55:      # 右侧 = 我方气泡
-                rows.append((y1 + offset_y, line.text))
+                rows.append((y1 + offset_y, y2 + offset_y, line.text))
         rows.sort(key=lambda item: item[0])
-        return [text for _y, text in rows]
+        return rows
+
+    def _outgoing_blocks(self, image, regions: Regions):
+        """同一气泡里的多行文字先合并，再和完整回复比较。"""
+        rows = self._outgoing_lines(image, regions)
+        blocks = []
+        for y1, y2, text in rows:
+            if blocks and y1 - blocks[-1]["y2"] <= 10:
+                blocks[-1]["parts"].append(text)
+                blocks[-1]["y2"] = max(blocks[-1]["y2"], y2)
+            else:
+                blocks.append({"y1": y1, "y2": y2, "parts": [text]})
+        return ["".join(block["parts"]) for block in blocks]
+
+    def _input_has_text(self, image, regions: Regions) -> bool:
+        """输入框里是否已经有别人写的字（不含右侧"发送"按钮）。
+
+        用像素判断，不依赖 OCR：输入框正常情况下是纯白，有文字时会出现深色像素。
+        """
+        try:
+            import numpy as np
+
+            x1, y1, x2, y2 = regions.input
+            width = max(1, x2 - x1)
+            crop = image.crop((x1, y1, x1 + int(width * 0.62), y2)).convert("L")
+            array = np.asarray(crop)
+            if array.size == 0:
+                return False
+            dark_ratio = float((array < 100).mean())
+            return dark_ratio > 0.005
+        except Exception:
+            return False
 
     def _verify_new_bubble(self, pre_image, post_image, regions: Regions, text: str) -> bool:
-        before = self._outgoing_texts(pre_image, regions)
-        after = self._outgoing_texts(post_image, regions)
+        before_lines = self._outgoing_lines(pre_image, regions)
+        after_lines = self._outgoing_lines(post_image, regions)
 
         def count_same(lines) -> int:
-            return sum(1 for line in lines if self._same_text(line, text))
+            return sum(1 for _y1, _y2, line in lines if self._same_text(line, text))
 
-        # 「同样内容的我方气泡」出现次数变多，才算本次新增
-        return count_same(after) > count_same(before)
+        if count_same(after_lines) > count_same(before_lines):
+            return True
+
+        # 回复被拆成多行渲染：按气泡合并后再比一次
+        before = self._outgoing_blocks(pre_image, regions)
+        after = self._outgoing_blocks(post_image, regions)
+        return sum(1 for block in after if self._same_text(block, text)) > \
+            sum(1 for block in before if self._same_text(block, text))
 
     @staticmethod
     def _same_text(a: str, b: str) -> bool:

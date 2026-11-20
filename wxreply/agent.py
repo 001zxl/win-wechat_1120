@@ -344,6 +344,11 @@ class Agent:
             self.sync_conversations()
         except Exception:
             pass
+        # 先补做失败重试 / 限频后补发，再扫描新未读
+        try:
+            self.drive_pending_work()
+        except Exception as exc:
+            self.emit("error", message=f"重试队列异常：{exc}")
         if not self._pending and not self._sentinel.should_scan(image, regions):
             return 0
         targets_fn = getattr(self.platform, "unread_targets", None)
@@ -503,6 +508,14 @@ class Agent:
         peer = (peer or "模拟客户").strip()
         if not peer.startswith("【模拟】"):
             peer = "【模拟】" + peer
+        # 接管期间模拟会话也不再自动回复，保证演示和正式流程一致
+        if self.handoff.is_taken(peer):
+            label = "（人工接管中，未自动回复）"
+            self._touch(peer, status="人工接管", unread=0, text=text)
+            self.emit("simulate", peer=peer, incoming=text, reply=label, auto=False,
+                      model="handoff", latency_ms=0, tools=[], escalated=True)
+            return {"peer": peer, "incoming": text, "reply": label, "auto": False,
+                    "model": "handoff", "latency_ms": 0, "tools": [], "escalated": True}
         history = self.memory.history_lines(peer, self.config.memory.recent_limit)
         profile = self.memory.profile(peer)
         decision = self.guardrails.assess_incoming(text)
@@ -1454,10 +1467,14 @@ class Agent:
                 self.emit("skip", peer=peer, reason=detail)
                 return False
 
-        # 人工接管中：只记录消息，不回复
+        # 人工接管中：只记录消息，不回复（同一批只记一次）
         if self.handoff.is_taken(peer):
-            for item in items:
-                self.memory.add(peer, "in", item.kind, item.prompt_text())
+            sig = normalize_name(" / ".join(item.prompt_text() for item in items))
+            _key, fresh = self._event_key(peer, sig)
+            if fresh:
+                for item in items:
+                    self.memory.add(peer, "in", item.kind, item.prompt_text())
+            self._mark_event(peer, "done")
             self._touch(peer, status="人工接管", unread=0)
             self.audit.record(peer=peer, action="skip", status="manual_takeover",
                               incoming=" / ".join(item.prompt_text() for item in items))
@@ -1466,17 +1483,42 @@ class Agent:
 
         return self._respond(peer, items, image, regions, is_group)
 
-    # ---------- 事件去重：同一批消息 = 同一事件 ----------
+    # ---------- 事件状态机：待处理 / 待重试 / 待发送 / 已完成 ----------
     def _event_key(self, peer: str, signature: str) -> Tuple[str, bool]:
-        """内容相同的「新消息」必须算新事件：只有同一批消息的重复扫描才去重。"""
+        """内容相同的「新消息」必须算新事件；失败/限频的事件允许到期后重试。"""
+        now = time.time()
         state = self._event_state.get(peer)
-        if state and state.get("signature") == signature and not state.get("sent"):
-            return state["key"], False
+        if state and state.get("signature") == signature:
+            status = state.get("status")
+            if status == "running":
+                return state["key"], False
+            if status == "held":
+                return state["key"], False
+            if status == "retry":
+                if now < float(state.get("next_at") or 0):
+                    return state["key"], False
+                state["status"] = "running"
+                state["started"] = now
+                return state["key"], True
+            if status == "done":
+                pass      # 已回复过，客户又说了一遍同样的话 → 新事件
         seq = max(self._event_seq.get(peer, 0), self._try_ledger_max(peer)) + 1
         self._event_seq[peer] = seq
         key = "%s#%d" % (signature, seq)
-        self._event_state[peer] = {"signature": signature, "key": key, "seq": seq, "sent": False}
+        self._event_state[peer] = {"signature": signature, "key": key, "seq": seq,
+                                   "status": "running", "started": now,
+                                   "attempts": 0, "next_at": 0.0}
         return key, True
+
+    def _mark_event(self, peer: str, status: str, delay: float = 0.0) -> None:
+        state = self._event_state.get(peer)
+        if not state:
+            return
+        state["status"] = status
+        if delay:
+            state["next_at"] = time.time() + delay
+        if status == "retry":
+            state["attempts"] = int(state.get("attempts", 0)) + 1
 
     def _try_ledger_max(self, peer: str) -> int:
         try:
@@ -1492,30 +1534,119 @@ class Agent:
             recorded.add(key)
             self.memory.add(peer, "in", item.kind, item.prompt_text())
 
+    # ---------- 失败重试 / 限频后补发 ----------
+    def drive_pending_work(self) -> None:
+        """每轮扫描时调用：重试失败的生成、补发被限频挡住的草稿。"""
+        with self.wx_lock:
+            self._drive_retries()
+            self._flush_held()
+
+    def _drive_retries(self) -> None:
+        now = time.time()
+        for peer, state in list(self._event_state.items()):
+            if state.get("status") != "retry" or now < float(state.get("next_at") or 0):
+                continue
+            if self.handoff.is_taken(peer):
+                self._mark_event(peer, "done")
+                continue
+            if int(state.get("attempts", 0)) > 5:
+                self.emit("skip", peer=peer, reason="重试多次仍失败，转人工处理")
+                self.handoff.take(peer, "自动回复多次失败")
+                self._mark_event(peer, "done")
+                continue
+            try:
+                if not self.open_conversation(peer):
+                    self._mark_event(peer, "retry", delay=60.0)
+                    continue
+                image = self.platform.capture()
+                if image is None:
+                    self._mark_event(peer, "retry", delay=30.0)
+                    continue
+                regions = self.layout.regions(image.width, image.height)
+                items = self._read_items(image, regions)
+                if not items:
+                    self._mark_event(peer, "done")
+                    continue
+                self.emit("retry", peer=peer, reason="重试自动回复")
+                self._respond(peer, items, image, regions, is_group_name(peer), remember=False)
+            except Exception as exc:
+                self.emit("error", message=f"重试失败：{exc}")
+                self._mark_event(peer, "retry", delay=60.0)
+
+    def _flush_held(self) -> None:
+        """被限频/闸门挡住但已有草稿的会话：条件恢复后自动补发（先核对消息版本）。"""
+        for peer in list(self._pending.keys()):
+            pending = self._pending.get(peer)
+            if not pending or not pending.get("held_reason"):
+                continue
+            if self.handoff.is_taken(peer):
+                continue
+            ok, _reason = self.send_gate(peer)
+            if not ok:
+                continue
+            latest = self._latest_incoming(peer)
+            if latest is None:
+                continue
+            if not latest:
+                self._drop_pending(peer)
+                continue
+            signature = normalize_name(" / ".join(item.prompt_text() for item in latest))
+            if signature != pending.get("signature"):
+                self._drop_pending(peer)
+                self._mark_event(peer, "retry", delay=1.0)
+                self.emit("skip", peer=peer, reason="草稿过期（客户有新消息），重新生成")
+                continue
+            guard = self._make_guard(peer, signature)
+            outcome = self.sender.send(peer, pending["reply"], pending["image"],
+                                       pending["regions"], guard=guard)
+            self._finish_send(peer, pending["reply"], outcome, pending.get("incoming", ""),
+                              pending.get("model", ""), pending.get("latency_ms", 0),
+                              pending.get("event_key", ""), int(pending.get("event_seq") or 0))
+            return
+
+    def _make_guard(self, peer: str, signature: str):
+        def guard():
+            if self.handoff.is_taken(peer):
+                return "manual_takeover"
+            latest = self._latest_incoming(peer)
+            if latest is None:
+                return None                 # 无法确认：交给 header / 输入框检查兜底
+            if not latest:
+                return "human_replied"
+            current = normalize_name(" / ".join(item.prompt_text() for item in latest))
+            if current != signature:
+                return "new_message"
+            return None
+        return guard
+
     # ---------- 生成并（在允许时）发送 ----------
-    def _respond(self, peer: str, items, image, regions: Regions, is_group: bool) -> bool:
+    def _respond(self, peer: str, items, image, regions: Regions, is_group: bool,
+                 remember: bool = True) -> bool:
         incoming = [item.prompt_text() for item in items]
         joined = " / ".join(incoming)
         signature = normalize_name(joined)
 
         event_key, is_new = self._event_key(peer, signature)
         if not is_new:
-            self.emit("skip", peer=peer, reason="同一批消息重复扫描，已忽略")
+            self.emit("skip", peer=peer, reason="同一批消息处理中或等待重试，已忽略")
             return False
         already = self._already_sent(peer, event_key)
         if already:
+            self._mark_event(peer, "done")
             self.emit("skip", peer=peer, reason=f"这批消息已发送过（{already}），不重复发送")
             return False
 
         pending = self._pending.get(peer)
         if pending and pending.get("event_key") == event_key:
+            self._mark_event(peer, "held")
             self.emit("skip", peer=peer, reason="已有同批消息的待发草稿，直接复用")
             return True
 
         self._touch(peer, status="处理中", unread=0)
-        # 只有确认是「新事件」才写记忆：重复扫描不会把同一句客户消息记两遍
+        # 只有确认是「新事件」才写记忆：重复扫描/重试不会把同一句客户消息记两遍
         recorded = set()
-        self._remember_items(peer, items, recorded)
+        if remember:
+            self._remember_items(peer, items, recorded)
         self.emit("incoming", peer=peer, messages=incoming, kinds=[item.kind for item in items])
 
         history = self.memory.history_lines(peer, self.config.memory.recent_limit)
@@ -1528,10 +1659,12 @@ class Agent:
             self.audit.record(peer=peer, action="escalate", status="handoff",
                               incoming=joined, detail=decision.reason)
             self.emit("escalate", peer=peer, reason=decision.reason)
+            self._mark_event(peer, "done")
             return False
 
         reply, model, latency, tool_results = None, "", 0, []
-        # 生成期间客户可能连续补充：最多重生成 2 次，每次都按“最新一批消息”重新判断
+        converged = False
+        # 生成期间客户可能连续补充：最多重生成 2 次；超过仍不一致就挂起，绝不发旧答案
         for _round in range(3):
             tool_results = self.tools.prefetch(joined)
             for result in tool_results:
@@ -1539,17 +1672,23 @@ class Agent:
             reply, model, latency = self._generate(incoming, joined, history, profile,
                                                    tool_results, is_group, peer=peer)
             if reply is None:
+                self._touch(peer, status="生成失败待重试")
+                self._mark_event(peer, "retry", delay=15.0)
+                self.emit("skip", peer=peer, reason="模型失败，稍后自动重试")
                 return False
             latest = self._latest_incoming(peer)
             if latest is None:
-                break                      # 无法复核（抓图/标题失败），发送前还会再比对
+                converged = True       # 无法复核，交给发送前的 header/输入框检查
+                break
             if not latest:
                 self.emit("skip", peer=peer, reason="客户已被人工回复，放弃自动草稿")
                 self.audit.record(peer=peer, action="skip", status="human_replied", incoming=joined)
+                self._mark_event(peer, "done")
                 return False
             latest_joined = " / ".join(item.prompt_text() for item in latest)
             if normalize_name(latest_joined) == signature:
-                break                      # 没有新消息，草稿有效
+                converged = True
+                break
             items = latest
             incoming = [item.prompt_text() for item in items]
             joined = latest_joined
@@ -1563,8 +1702,17 @@ class Agent:
                 self.audit.record(peer=peer, action="escalate", status="handoff",
                                   incoming=joined, detail=decision.reason)
                 self.emit("escalate", peer=peer, reason=decision.reason)
+                self._mark_event(peer, "done")
                 return False
         if reply is None:
+            return False
+        if not converged:
+            # 客户一直在改：答案已经对不上最新需求，先挂起，等下一轮重新生成
+            self._touch(peer, status="对话仍在变化，暂缓回复")
+            self.audit.record(peer=peer, action="skip", status="conversation_moving",
+                              incoming=joined, reply=reply)
+            self.emit("skip", peer=peer, reason="客户仍在补充消息，暂缓回复")
+            self._mark_event(peer, "retry", delay=3.0)
             return False
 
         state = self._event_state.get(peer) or {}
@@ -1590,17 +1738,27 @@ class Agent:
 
         ok, reason = self.send_gate(peer)
         if not ok:
-            # 草稿保留在待发队列，绝不因为"看起来该发"就发出去
+            # 草稿保留在待发队列，闸门恢复后由 _flush_held 补发
+            self._pending[peer]["held_reason"] = reason
             self.audit.record(peer=peer, action="draft", status=f"held_{reason}",
                               incoming=joined, reply=reply, model=model, latency_ms=latency)
             self.emit("held", peer=peer, reason=reason, reply=reply)
+            self._mark_event(peer, "held")
             return True
 
-        # 生成期间可能有人点了"转人工"，发送前再确认一次
-        if self.handoff.is_taken(peer):
-            self.emit("held", peer=peer, reason="manual_takeover", reply=reply)
-            return True
-        outcome = self.sender.send(peer, reply, image, regions)
+        guard = self._make_guard(peer, signature)
+        outcome = self.sender.send(peer, reply, image, regions, guard=guard)
+        status, detail = outcome.outcome.status, outcome.outcome.detail
+        if status == "aborted" and detail in ("manual_takeover", "human_replied"):
+            self._mark_event(peer, "done")
+        elif status == "aborted" and detail == "new_message":
+            self._drop_pending(peer)
+            self._mark_event(peer, "retry", delay=1.0)
+            self.emit("skip", peer=peer, reason="发送前客户又改了消息，重新生成")
+        elif status == "aborted" and detail == "input_not_empty":
+            self.handoff.take(peer, "输入框里有未发送内容")
+            self.emit("handoff", peer=peer, reason="输入框有内容，暂停自动发送，请人工处理")
+            self._mark_event(peer, "done")
         return self._finish_send(peer, reply, outcome, joined, model, latency,
                                  event_key, event_seq)
 
@@ -1708,6 +1866,7 @@ class Agent:
             state = self._event_state.get(peer) or {}
             if state.get("key") == signature:
                 state["sent"] = True
+            self._mark_event(peer, "done")
             self.limiter.record(peer, cost=1)
             self._pending.pop(peer, None)
             if peer in self._pending_order:
@@ -1719,9 +1878,12 @@ class Agent:
             # 已经按过回车但没能确认：不再自动重发，转人工核查，避免重复轰炸客户
             self.handoff.take(peer, "发送状态不明，需人工核查")
             self._touch(peer, status="发送待人工确认")
+            self._mark_event(peer, "done")
             self.emit("handoff", peer=peer, reason="发送状态不明，已暂停自动回复")
         else:
             self._touch(peer, status=f"未发送（{detail}）")
+            if status == "failed":
+                self._mark_event(peer, "retry", delay=20.0)
         self.emit("sent", peer=peer, status=status, reply=reply, detail=detail)
         return False
 
@@ -2092,6 +2254,36 @@ class Agent:
             return {"ok": False, "status": "blocked", "detail": checked.reason,
                     "peer": peer, "reply": reply}
         pending["reply"] = checked.text
+        event_key = pending.get("event_key") or normalize_name(pending.get("incoming", ""))
+        event_seq = int(pending.get("event_seq") or 0)
+
+        # 模拟会话：只走项目内的"发送"，不碰真实微信
+        if peer.startswith("【模拟】"):
+            self.audit.record_send(peer, event_key, pending["reply"], "verified", "simulated",
+                                   event=event_seq)
+            self.memory.add(peer, "out", "text", pending["reply"])
+            self._touch(peer, status="模拟已回复", text=pending["reply"])
+            self._drop_pending(peer)
+            self.emit("sent", peer=peer, status="verified", reply=pending["reply"],
+                      detail="simulated")
+            return {"ok": True, "status": "verified", "detail": "simulated",
+                    "peer": peer, "reply": pending["reply"]}
+
+        # 先把目标会话切到前台，再做版本校验：否则"当前打开的是别人"会被误判成无法确认
+        current = self.platform.capture()
+        if current is not None:
+            regions = self.layout.regions(current.width, current.height)
+            header_now = self.sender.read_header(current, regions)
+            if not is_same_peer_strict(header_now, peer):
+                if not self.open_conversation(peer):
+                    return {"ok": False, "status": "aborted",
+                            "detail": "无法切回目标会话", "peer": peer,
+                            "reply": pending["reply"]}
+                current = self.platform.capture()
+        if current is None:
+            return {"ok": False, "status": "aborted", "detail": "抓图失败", "peer": peer}
+        pending["image"] = current
+        pending["regions"] = self.layout.regions(current.width, current.height)
 
         # 草稿版本校验：客户又发了新消息、或已被人工回复，旧草稿作废
         latest = self._latest_incoming(peer)
@@ -2117,33 +2309,18 @@ class Agent:
             return {"ok": False, "status": "blocked", "detail": reason,
                     "peer": peer, "reply": pending["reply"]}
 
-        event_key = pending.get("event_key") or normalize_name(pending.get("incoming", ""))
         already = self._already_sent(peer, event_key)
         if already == "verified":
             return {"ok": False, "status": "duplicate",
                     "detail": "这批消息已确认发送过，拒绝重复发送",
                     "peer": peer, "reply": pending["reply"]}
 
-        # 如果用户已经切到别的会话，先切回目标会话再发
-        current = self.platform.capture()
-        if current is not None:
-            regions = self.layout.regions(current.width, current.height)
-            header_now = self.sender.read_header(current, regions)
-            if not is_same_peer_strict(header_now, peer):
-                if not self.open_conversation(peer):
-                    return {"ok": False, "status": "aborted",
-                            "detail": "无法切回目标会话", "peer": peer,
-                            "reply": pending["reply"]}
-                pending["image"] = self.platform.capture()
-                pending["regions"] = self.layout.regions(
-                    pending["image"].width, pending["image"].height
-                ) if pending["image"] is not None else pending["regions"]
-        if pending["image"] is None:
-            pending["image"] = self.platform.capture()
-        outcome = self.sender.send(peer, pending["reply"], pending["image"], pending["regions"])
+        guard = self._make_guard(peer, pending.get("signature", ""))
+        outcome = self.sender.send(peer, pending["reply"], pending["image"],
+                                   pending["regions"], guard=guard)
         ok = self._finish_send(peer, pending["reply"], outcome, pending.get("incoming", ""),
                                pending.get("model", ""), pending.get("latency_ms", 0),
-                               event_key, int(pending.get("event_seq") or 0))
+                               event_key, event_seq)
         return {"ok": ok, "status": outcome.outcome.status, "detail": outcome.outcome.detail,
                 "peer": peer, "reply": pending["reply"]}
 
