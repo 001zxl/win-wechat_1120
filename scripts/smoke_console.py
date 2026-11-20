@@ -3,6 +3,9 @@
 用法：
     1) 先启动：.venv\\Scripts\\python.exe server.py --mock --no-browser --port 8791
     2) 再运行：.venv\\Scripts\\python.exe scripts\\smoke_console.py 8791
+
+注意：会在本机 data/ 里留下【模拟】冒烟A/B 的会话与接管记录（审计、记忆、handoff）。
+跑完想清干净：删掉 data/handoff.json 里的【模拟】* 项，或直接用一份临时工作目录。
 """
 import json
 import sys
