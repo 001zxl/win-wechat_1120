@@ -46,6 +46,13 @@
     min-height: 0; height: 100%; overflow: hidden; }
   .card > .title { flex: none; }
   .card .title { font-size: 12px; color: #6b7280; padding: 10px 12px 6px; font-weight: 600; letter-spacing: .02em; }
+  #handoffs { flex: 0 1 auto; max-height: 34%; overflow-y: auto; padding: 0 10px 8px; }
+  .handoff { border: 1px solid #f0f0f0; border-radius: 8px; padding: 8px; margin-bottom: 6px; background: #fffaf0; }
+  .handoff-main { display: flex; align-items: baseline; gap: 6px; }
+  .handoff-main b { font-size: 13px; }
+  .handoff .reason { font-size: 12px; color: #ad6800; margin-top: 2px; }
+  .handoff-actions { display: flex; gap: 6px; margin-top: 6px; }
+  .handoff-actions button { font-size: 12px; padding: 2px 8px; }
   .conv-scroll { flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden; }
   #conversations { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 4px 8px 8px;
     overscroll-behavior: contain; scrollbar-width: none; }
@@ -231,6 +238,11 @@
         <button id="apply">应用要求</button>
       </div>
     </div>
+  </section>
+
+  <section class="card">
+    <div class="title">待人工处理</div>
+    <div id="handoffs"><div class="empty">暂无</div></div>
   </section>
 
   <section class="card">
@@ -517,6 +529,7 @@ async function fetchState() {
     }
     renderChips(state.status);
     renderWhitelist(state.status.whitelist_names);
+    renderHandoffs(state.status.handoffs);
     renderConversations(state.conversations, selected);
     renderChat();
     renderDraft();
@@ -543,6 +556,40 @@ async function act(action, payload = {}) {
   }
 }
 
+
+// ---------- 待人工处理 ----------
+function renderHandoffs(items) {
+  const box = $("handoffs");
+  const list = items || [];
+  if (!list.length) {
+    box.innerHTML = '<div class="empty">暂无</div>';
+    return;
+  }
+  box.innerHTML = list.map((item) => {
+    const ts = item.since
+      ? new Date(item.since * 1000).toLocaleTimeString("zh-CN", { hour12: false })
+      : "";
+    return `<div class="handoff">
+      <div class="handoff-main"><b>${escapeHtml(item.peer)}</b><span class="conv-time">${ts}</span></div>
+      <div class="reason">${escapeHtml(item.reason || "人工接管")}</div>
+      <div class="handoff-actions">
+        <button data-open="${escapeAttr(item.peer)}">打开会话</button>
+        <button data-release="${escapeAttr(item.peer)}">恢复自动</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+$("handoffs").addEventListener("click", async (event) => {
+  const btn = event.target.closest("button");
+  if (!btn) return;
+  if (btn.dataset.open) {
+    await act("open", { peer: btn.dataset.open });
+  } else if (btn.dataset.release) {
+    await act("release", { peer: btn.dataset.release });
+  }
+  fetchState();
+});
 
 // ---------- 白名单 ----------
 let whitelistSignature = "";

@@ -644,6 +644,61 @@ class TestApproveWithOtherChatOpen(unittest.TestCase):
             agent.close()
 
 
+class TestRetryPersistence(unittest.TestCase):
+    def test_retry_queue_survives_restart(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            agent._generate = lambda *a, **k: (None, "fake", 0)   # 模型一直失败
+
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            agent._respond("张三", items, image, regions, False)
+            self.assertEqual(agent._event_state["张三"]["status"], "retry")
+            rows = agent.audit.list_retries()
+            self.assertEqual(len(rows), 1, "失败的待重试事件应落库")
+            self.assertEqual(rows[0][0], "张三")
+            agent.close()
+
+            # 模拟进程重启：同一套数据库重新建 Agent
+            platform2 = MockPlatform()
+            platform2.current = 0
+            agent2 = Agent(cfg, platform2, dry_run=True)
+            self.assertIn("张三", agent2._event_state, "重启后应恢复待重试队列")
+            self.assertEqual(agent2._event_state["张三"]["status"], "retry")
+
+            calls = {"n": 0}
+
+            def ok(*_a, **_k):
+                calls["n"] += 1
+                return ("在的", "fake", 1)
+
+            agent2._generate = ok
+            agent2._event_state["张三"]["next_at"] = 0
+            agent2.drive_pending_work()
+            self.assertEqual(calls["n"], 1, "重启后应自动补回这条消息")
+            self.assertIn("张三", agent2._pending)
+            agent2.close()
+
+    def test_retry_row_removed_after_success(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            agent._generate = lambda *a, **k: ("在的", "fake", 1)
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            agent._respond("张三", items, image, regions, False)
+            # dry-run 下是 held，不应该是 retry；恢复后可被 flush，这里只验证记录不在重试表
+            self.assertEqual(agent.audit.list_retries(), [])
+            agent.close()
+
+
 class TestSecurityAndNaming(unittest.TestCase):
     def test_static_path_traversal_blocked(self) -> None:
         self.assertIsNone(resolve_static_path(WEB_DIR, "../config.example.yaml"))

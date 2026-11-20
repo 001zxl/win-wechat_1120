@@ -172,6 +172,8 @@ class Agent:
         self._deep_page: Optional[int] = None
         self._last_error: str = ""
         self._reading: set = set()
+        # 重启后恢复待重试队列（与发送台账同库）
+        self._load_retries()
 
     # ---------- 运行控制 ----------
     def set_dry_run(self, value: bool) -> None:
@@ -1508,7 +1510,31 @@ class Agent:
         self._event_state[peer] = {"signature": signature, "key": key, "seq": seq,
                                    "status": "running", "started": now,
                                    "attempts": 0, "next_at": 0.0}
+        try:
+            self.audit.delete_retry(peer)     # 新事件开始，旧的待重试记录作废
+        except Exception:
+            pass
         return key, True
+
+    def _load_retries(self) -> None:
+        try:
+            rows = self.audit.list_retries()
+        except Exception:
+            return
+        for row in rows:
+            peer, signature, event_seq, status, attempts, next_at, last_error = row
+            seq = int(event_seq or 0)
+            self._event_state[peer] = {
+                "signature": signature or "",
+                "key": "%s#%d" % (signature or "", seq),
+                "seq": seq,
+                "status": status or "retry",
+                "attempts": int(attempts or 0),
+                "next_at": float(next_at or 0),
+                "started": 0.0,
+                "last_error": last_error or "",
+            }
+            self._event_seq[peer] = max(self._event_seq.get(peer, 0), seq)
 
     def _mark_event(self, peer: str, status: str, delay: float = 0.0) -> None:
         state = self._event_state.get(peer)
@@ -1519,6 +1545,17 @@ class Agent:
             state["next_at"] = time.time() + delay
         if status == "retry":
             state["attempts"] = int(state.get("attempts", 0)) + 1
+        try:
+            if status == "retry":
+                self.audit.upsert_retry(
+                    peer, state.get("signature", ""), int(state.get("seq") or 0),
+                    status, int(state.get("attempts", 0)),
+                    float(state.get("next_at") or 0), str(state.get("last_error") or ""))
+            else:
+                # held 的草稿在内存里，重启即丢失，不写重试表；done 要清掉旧记录
+                self.audit.delete_retry(peer)
+        except Exception:
+            pass
 
     def _try_ledger_max(self, peer: str) -> int:
         try:
@@ -1673,6 +1710,9 @@ class Agent:
                                                    tool_results, is_group, peer=peer)
             if reply is None:
                 self._touch(peer, status="生成失败待重试")
+                state = self._event_state.get(peer)
+                if state is not None:
+                    state["last_error"] = self._last_error
                 self._mark_event(peer, "retry", delay=15.0)
                 self.emit("skip", peer=peer, reason="模型失败，稍后自动重试")
                 return False

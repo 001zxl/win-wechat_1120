@@ -65,6 +65,21 @@ class AuditStore:
                     self._connection.execute("ALTER TABLE sends ADD COLUMN event INTEGER DEFAULT 0")
             except Exception:
                 pass
+            # 待重试队列：和发送台账同库，重启后仍能自动补回
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retries (
+                    peer TEXT PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    signature TEXT,
+                    event_seq INTEGER,
+                    status TEXT,
+                    attempts INTEGER,
+                    next_at REAL,
+                    last_error TEXT
+                )
+                """
+            )
             self._connection.commit()
 
     def record(
@@ -129,6 +144,33 @@ class AuditStore:
             return int(row[0] or 0)
         except Exception:
             return 0
+
+    # ---------- 待重试队列（持久化） ----------
+    def upsert_retry(self, peer: str, signature: str, event_seq: int, status: str,
+                     attempts: int, next_at: float, last_error: str = "") -> None:
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO retries (peer, ts, signature, event_seq, status, attempts, next_at, last_error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(peer) DO UPDATE SET ts=excluded.ts, signature=excluded.signature, "
+                "event_seq=excluded.event_seq, status=excluded.status, attempts=excluded.attempts, "
+                "next_at=excluded.next_at, last_error=excluded.last_error",
+                (peer, time.time(), signature, int(event_seq), status, int(attempts),
+                 float(next_at), last_error),
+            )
+            self._connection.commit()
+
+    def delete_retry(self, peer: str) -> None:
+        with self._lock:
+            self._connection.execute("DELETE FROM retries WHERE peer = ?", (peer,))
+            self._connection.commit()
+
+    def list_retries(self):
+        with self._lock:
+            return self._connection.execute(
+                "SELECT peer, signature, event_seq, status, attempts, next_at, last_error "
+                "FROM retries ORDER BY next_at ASC"
+            ).fetchall()
 
     def find_send(self, peer: str, signature: str):
         with self._lock:
