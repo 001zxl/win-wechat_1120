@@ -17,14 +17,17 @@ class VisionClient:
         self.config = config
         self.base_url = config.vision_base_url or config.base_url
         self.model = config.vision_model or config.model
+        # 视觉凭据独立：没有单独配置时，只在同一个网关下复用聊天 key
+        self.api_key = config.vision_api_key or (
+            config._fallback_key(self.base_url) if config.vision_model else "")
 
     @property
     def available(self) -> bool:
         # 必须显式配置 vision_model 才算"能用视觉"：
         # 否则会拿纯文本模型（deepseek-chat）硬解图片，模型只能瞎编"这是一张微信聊天截图…"，
         # 还会让每个循环都把窗口当成新图片，无限重写草稿。
-        return bool(self.config.vision_model) and bool(self.config.api_key) \
-            and "REPLACE" not in self.config.api_key
+        return bool(self.config.vision_model) and bool(self.api_key) \
+            and "REPLACE" not in self.api_key
 
     def describe(self, image_path: str, question: str = "") -> str:
         if not self.available or not image_path or not os.path.exists(image_path):
@@ -49,7 +52,7 @@ class VisionClient:
                 }
             ],
         }
-        headers = {"Authorization": f"Bearer {self.config.api_key}", "Content-Type": "application/json"}
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         try:
             response = requests.post(
                 self.base_url.rstrip("/") + "/chat/completions",

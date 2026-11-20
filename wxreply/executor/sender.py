@@ -268,19 +268,26 @@ class SafeSender:
     def _input_has_text(self, image, regions: Regions) -> bool:
         """输入框里是否已经有别人写的字（不含右侧"发送"按钮）。
 
-        用像素判断，不依赖 OCR：输入框正常情况下是纯白，有文字时会出现深色像素。
+        覆盖：单个汉字/数字、表情、粘贴的图片。光标是 1~2 像素宽的竖线，
+        用"有文字的列数"把它排除掉，避免空输入框里的光标导致误判。
         """
         try:
             import numpy as np
 
             x1, y1, x2, y2 = regions.input
             width = max(1, x2 - x1)
-            crop = image.crop((x1, y1, x1 + int(width * 0.62), y2)).convert("L")
-            array = np.asarray(crop)
-            if array.size == 0:
+            box = (x1, y1, x1 + int(width * 0.62), y2)
+            gray = np.asarray(image.crop(box).convert("L"))
+            if gray.size == 0:
                 return False
-            dark_ratio = float((array < 100).mean())
-            return dark_ratio > 0.005
+            mask = gray < 140
+            columns = mask.sum(axis=0)
+            # 一个汉字/数字会横跨多列；光标只会占 1~2 列
+            if int((columns >= 3).sum()) >= 4:
+                return True
+            rgb = np.asarray(image.crop(box).convert("RGB")).astype(int)
+            colorful = float(((rgb.max(axis=2) - rgb.min(axis=2)) > 40).mean())
+            return colorful > 0.002              # 表情/图片
         except Exception:
             return False
 

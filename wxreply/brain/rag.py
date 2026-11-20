@@ -82,9 +82,13 @@ class EmbeddingClient:
         except Exception:
             pass
 
-    @staticmethod
-    def _key(text: str) -> str:
-        return hashlib.sha1(text.encode("utf-8")).hexdigest()
+    @property
+    def namespace(self) -> str:
+        # 缓存必须绑定"供应商 + 模型 + 维度"：换 embedding 模型后旧向量不可复用
+        return f"{self.base_url}|{self.model}"
+
+    def _key(self, text: str) -> str:
+        return hashlib.sha1(f"{self.namespace}|{text}".encode("utf-8")).hexdigest()
 
     def embed(self, texts: List[str]) -> Optional[List[List[float]]]:
         if not self.available or not texts:
@@ -124,11 +128,31 @@ class KnowledgeBase:
         self._vectors: Optional[List[List[float]]] = None
         self._doc_freq: Dict[str, int] = {}
         self._avg_len = 0.0
+        self.min_cosine = 0.30          # 向量相似度低于该值不算"命中"
         self._load()
 
     @property
     def size(self) -> int:
         return len(self.chunks)
+
+    @property
+    def version(self) -> str:
+        """知识库版本：内容变化即变化，控制台可以看到当前生效的是哪一版。"""
+        digest = hashlib.sha1()
+        for chunk in self.chunks:
+            digest.update((chunk.source or "").encode("utf-8"))
+            digest.update(chunk.text.encode("utf-8"))
+        return digest.hexdigest()[:12]
+
+    def reload(self) -> int:
+        """重新扫描 kb 目录（文件改了以后手动/定时调用）。"""
+        self.chunks = []
+        self._doc_freq = {}
+        self._avg_len = 0.0
+        self._vectors = None
+        self._load()
+        return len(self.chunks)
+
 
     def _load(self) -> None:
         if not self.directory or not os.path.isdir(self.directory):
@@ -208,5 +232,9 @@ class KnowledgeBase:
         bm25_rank = {i: rank for rank, i in enumerate(sorted(range(len(bm25)), key=lambda i: bm25[i], reverse=True))}
         vec_rank = {i: rank for rank, i in enumerate(sorted(range(len(cosines)), key=lambda i: cosines[i], reverse=True))}
         fused = {i: 1.0 / (60 + bm25_rank[i]) + 1.0 / (60 + vec_rank[i]) for i in range(len(bm25))}
-        order = sorted(fused, key=lambda i: fused[i], reverse=True)
+        # 关键词和向量都没命中时返回空：宁可"没有可靠答案"，也不要硬塞一段知识
+        eligible = [i for i in range(len(bm25)) if bm25[i] > 0 or cosines[i] >= self.min_cosine]
+        if not eligible:
+            return []
+        order = sorted(eligible, key=lambda i: fused[i], reverse=True)
         return [self.chunks[i] for i in order[:top_k]]

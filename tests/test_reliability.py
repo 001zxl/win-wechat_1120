@@ -699,6 +699,209 @@ class TestRetryPersistence(unittest.TestCase):
             agent.close()
 
 
+class TestDraftBinding(unittest.TestCase):
+    def test_mismatched_draft_id_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            agent._generate = lambda *a, **k: ("按一个处理", "fake", 1)
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            agent._respond("张三", items, image, regions, False)
+            pending = agent._pending["张三"]
+            self.assertTrue(pending.get("draft_id"), "草稿必须有唯一 ID")
+
+            agent.set_dry_run(False)
+            agent.router.client.config.api_key = "sk-test"
+            bad = agent.approve_pending(peer="张三", draft_id="stale-id")
+            self.assertFalse(bad["ok"])
+            self.assertEqual(bad["status"], "stale")
+            self.assertIn("张三", agent._pending, "错误 ID 不应消耗草稿")
+            agent.close()
+
+
+class TestGuardOnAuthorizationChange(unittest.TestCase):
+    def _sender(self, cfg, platform):
+        return SafeSender(platform, cfg, Whitelist(cfg.safety.whitelist), None)
+
+    def test_paused_cancels_waiting_send(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.runtime.dry_run = False
+            platform = MockPlatform()
+            platform.current = 0
+            image = platform.capture()
+            sender = self._sender(cfg, platform)
+            sender.risk.plan = lambda peer, text: (1.2, "ok")
+            calls = {"n": 0}
+
+            def guard():
+                calls["n"] += 1
+                return "paused" if calls["n"] >= 2 else None
+
+            result = sender.send("张三", "在的", image, regions_for(platform), guard=guard)
+            self.assertEqual(result.outcome.detail, "paused")
+            self.assertEqual(platform.sent, [])
+
+    def test_whitelist_removed_cancels_send(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.runtime.dry_run = False
+            platform = MockPlatform()
+            platform.current = 0
+            image = platform.capture()
+            sender = self._sender(cfg, platform)
+            sender.risk.plan = lambda peer, text: (1.0, "ok")
+            calls = {"n": 0}
+
+            def guard():
+                calls["n"] += 1
+                return "not_whitelisted" if calls["n"] >= 2 else None
+
+            result = sender.send("张三", "在的", image, regions_for(platform), guard=guard)
+            self.assertEqual(result.outcome.detail, "not_whitelisted")
+            self.assertEqual(platform.sent, [])
+
+
+class TestShortInputDetection(unittest.TestCase):
+    def test_single_character_in_input_blocks_send(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.runtime.dry_run = False
+            platform = MockPlatform()
+            platform.current = 0
+            platform.draft = "不"          # 只有一个字
+            image = platform.capture()
+            sender = SafeSender(platform, cfg, Whitelist(cfg.safety.whitelist), None)
+            result = sender.send("张三", "按一个为您处理", image, regions_for(platform))
+            self.assertEqual(result.outcome.detail, "input_not_empty")
+            self.assertEqual(platform.sent, [])
+
+
+class TestHeldFlushFairness(unittest.TestCase):
+    def test_two_customers_both_flushed(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.safety.whitelist = ["张三", "李四"]
+            platform = MockPlatform()
+            platform.current = 0
+            agent = Agent(cfg, platform, dry_run=True)
+            agent.set_dry_run(False)
+            agent.router.client.config.api_key = "sk-test"
+            agent._generate = lambda *a, **k: ("在的", "fake", 1)
+
+            # 两个人各有一条待发草稿，先都被限频挡住
+            platform.sessions[1].messages.append({"dir": "in", "kind": "text", "text": "这款有货吗"})
+            agent.limiter.allowed = lambda peer: False
+            for index, peer in enumerate(("张三", "李四")):
+                platform.current = index
+                items = platform.read_incoming_items()
+                image = platform.capture()
+                regions = agent.layout.regions(image.width, image.height)
+                agent._respond(peer, items, image, regions, False)
+            self.assertEqual(len(agent._pending), 2, "两位客户都应进入待发队列")
+
+            def open_peer(peer):
+                for index, session in enumerate(platform.sessions):
+                    if session.name == peer:
+                        platform.current = index
+                        return True
+                return False
+
+            agent.open_conversation = open_peer
+            agent.limiter.allowed = lambda peer: True
+            agent._flush_held()
+            self.assertEqual(sorted(name for name, _text in platform.sent), ["张三", "李四"])
+            self.assertEqual(agent._pending, {})
+            agent.close()
+
+
+class TestCredentialIsolation(unittest.TestCase):
+    def test_keys_do_not_leak_between_providers(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.ai.base_url = "https://api.deepseek.com/v1"
+            cfg.ai.model = "deepseek-chat"
+            cfg.ai.models = [
+                {"id": "deepseek", "label": "DeepSeek", "model": "deepseek-chat",
+                 "base_url": "https://api.deepseek.com/v1"},
+                {"id": "qwen", "label": "Qwen", "model": "qwen-plus",
+                 "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+            ]
+            cfg.ai.model_keys = {"deepseek": "sk-deepseek", "qwen": ""}
+            options = {item.id: item for item in cfg.ai.options()}
+            self.assertEqual(options["deepseek"].api_key, "sk-deepseek")
+            self.assertEqual(options["qwen"].api_key, "", "B 模型不能继承 A 的 key")
+
+            # 删除 key 应立即失效
+            cfg.ai.model_keys = {"deepseek": "", "qwen": ""}
+            options = {item.id: item for item in cfg.ai.options()}
+            self.assertEqual(options["deepseek"].api_key, "")
+
+
+class TestHandoffCorruption(unittest.TestCase):
+    def test_corrupt_file_blocks_autosend(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = os.path.join(tmp, "handoff.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("{ this is not json")
+            store = HandoffStore(path)
+            self.assertTrue(store.corrupt, "损坏文件不能被静默当成空名单")
+
+            cfg = make_config(tmp)
+            cfg.handoff_path = path
+            agent = Agent(cfg, MockPlatform(), dry_run=True)
+            agent.set_dry_run(False)
+            agent.router.client.config.api_key = "sk-test"
+            ok, reason = agent.send_gate("张三")
+            self.assertFalse(ok)
+            self.assertEqual(reason, "handoff_corrupt")
+            agent.close()
+
+    def test_backup_restores_when_main_file_broken(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = os.path.join(tmp, "handoff.json")
+            store = HandoffStore(path)
+            store.take("张三", "投诉")
+            self.assertTrue(os.path.exists(path + ".bak"))
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("broken")
+            restored = HandoffStore(path)
+            self.assertFalse(restored.corrupt, "有备份时应自动恢复")
+            self.assertTrue(restored.is_taken("张三"))
+            self.assertEqual(restored.recovered_from, path + ".bak")
+
+
+class TestLayoutStructure(unittest.TestCase):
+    def test_right_column_groups_two_cards(self) -> None:
+        html_path = os.path.join(ROOT, "web", "index.html")
+        with open(html_path, "r", encoding="utf-8") as handle:
+            html = handle.read()
+        self.assertIn('class="right-col"', html)
+        self.assertIn('class="card handoff-card"', html)
+        self.assertIn('class="card events-card"', html)
+        self.assertIn(".right-col { display: flex; flex-direction: column", html)
+
+
+class TestSummaryPerCustomer(unittest.TestCase):
+    def test_other_customers_do_not_trigger_summary(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.memory.summarize_after = 5
+            agent = Agent(cfg, MockPlatform(), dry_run=True)
+            for _ in range(3):
+                agent.memory.add("张三", "in", "text", "你好")
+            for _ in range(10):
+                agent.memory.add("李四", "in", "text", "在吗")
+            self.assertFalse(agent.memory.needs_summary("张三"),
+                             "张三只有 3 条，不能因为李四的消息多就触发摘要")
+            self.assertTrue(agent.memory.needs_summary("李四"))
+            agent.close()
+
+
 class TestSecurityAndNaming(unittest.TestCase):
     def test_static_path_traversal_blocked(self) -> None:
         self.assertIsNone(resolve_static_path(WEB_DIR, "../config.example.yaml"))

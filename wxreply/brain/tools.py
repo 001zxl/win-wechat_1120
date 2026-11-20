@@ -52,14 +52,13 @@ class ToolBox:
             for name in names:
                 if name and _norm(name) in target:
                     return product
-        if len(self.products) == 1:
-            return self.products[0]
+        # 不做"只有一个产品就套用"的兜底：型号不明时必须问清楚，不能默认报价
         return None
 
     @staticmethod
     def _parse_quantity(text: str) -> Optional[int]:
-        # 必须带单位，避免把型号 FT-120 里的 120 当成数量
-        match = re.search(r"(\d{2,7})\s*(?:件|个|pcs|套|台|条|只)", text or "", re.I)
+        # 必须带单位，避免把型号 FT-120 里的 120 当成数量；个位数也要能解析（"1件"）
+        match = re.search(r"(\d{1,7})\s*(?:件|个|pcs|套|台|条|只)", text or "", re.I)
         if match:
             try:
                 return int(match.group(1))
@@ -71,23 +70,34 @@ class ToolBox:
     def price_lookup(self, product: str = "", quantity: Optional[int] = None) -> ToolResult:
         item = self._match_product(product)
         if not item:
-            return ToolResult("price_lookup", False, "没有匹配到产品", {"product": product})
+            return ToolResult("price_lookup", False,
+                              "没有匹配到产品：请先确认客户要的型号/SKU，不要猜价格",
+                              {"product": product, "need": "product"})
+        # 模型可能只把原话传进来：数量从原文里再解析一次
+        if quantity is None:
+            quantity = self._parse_quantity(product)
         ranges = item.get("price_ranges") or []
+        if not ranges:
+            return ToolResult("price_lookup", False, "产品没有维护报价区间",
+                              {"sku": item.get("sku")})
+        if quantity is None:
+            return ToolResult("price_lookup", False,
+                              f"{item.get('name') or item.get('sku')} 的价格要看数量：请先问客户要多少件",
+                              {"sku": item.get("sku"), "need": "quantity"})
         matched = None
-        qty = quantity
-        if qty is not None:
-            for band in ranges:
-                if band.get("min_qty", 0) <= qty <= band.get("max_qty", 10**9):
-                    matched = band
-                    break
-        selected = matched or (ranges[0] if ranges else None)
-        if not selected:
-            return ToolResult("price_lookup", False, "产品没有报价区间", {"sku": item.get("sku")})
-        low, high = selected.get("price", [None, None])
-        summary = f"{item.get('name') or item.get('sku')}：{selected.get('min_qty')}-{selected.get('max_qty')} 件，FOB {low}-{high} 美金"
+        for band in ranges:
+            if band.get("min_qty", 0) <= quantity <= band.get("max_qty", 10**9):
+                matched = band
+                break
+        if matched is None:
+            return ToolResult("price_lookup", False,
+                              f"{quantity} 件不在任何已维护的报价档位内：需要业务确认，不要套用其它档位",
+                              {"sku": item.get("sku"), "quantity": quantity, "need": "band"})
+        low, high = matched.get("price", [None, None])
+        summary = f"{item.get('name') or item.get('sku')}：{matched.get('min_qty')}-{matched.get('max_qty')} 件，FOB {low}-{high} 美金"
         return ToolResult("price_lookup", True, summary, {
             "sku": item.get("sku"), "name": item.get("name"),
-            "quantity": qty, "range": selected, "price": selected.get("price"),
+            "quantity": quantity, "range": matched, "price": matched.get("price"),
         })
 
     def stock_check(self, product: str = "") -> ToolResult:
@@ -124,13 +134,18 @@ class ToolBox:
         if want_price or want_stock:
             product = self._match_product(text)
             quantity = self._parse_quantity(text)
+            if product is None:
+                # 产品不明：把"需要确认型号"作为约束传给模型，不给任何报价
+                if want_price:
+                    results.append(self.price_lookup(text, quantity))
+                if want_stock:
+                    results.append(self.stock_check(text))
+                return results
             if want_price:
                 results.append(self.price_lookup(text, quantity))
             if want_stock:
                 results.append(self.stock_check(text))
-            if product is None and not results:
-                results.append(ToolResult("price_lookup", False, "没有匹配到产品", {}))
-        return [item for item in results if item.ok]
+        return results
 
     # ---------- function calling schema ----------
     def schemas(self) -> List[Dict[str, Any]]:

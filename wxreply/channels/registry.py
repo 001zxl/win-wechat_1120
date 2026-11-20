@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import os
 from typing import Dict, Iterable, List, Optional
 
 from .base import Channel, ChannelConfig
 from .wechat import WeChatChannel
 from .webhook import WebhookChannel
+
+
+def external_channels_allowed() -> bool:
+    """首版只开微信通道：外部 IM 默认关闭，需要显式环境变量才启用。"""
+    return os.environ.get("WX_ENABLE_EXTERNAL_CHANNELS", "").strip().lower() in ("1", "true", "yes")
 
 
 def contact_key(channel_id: str, peer: str) -> str:
@@ -43,5 +49,7 @@ def build_registry(configs: Iterable[ChannelConfig], agent=None) -> ChannelRegis
         if item.type == "wechat" and agent is not None:
             registry.register(WeChatChannel(agent, item.id or "wechat"))
         elif item.type in ("line", "telegram", "webhook", "dingtalk"):
+            if not external_channels_allowed():
+                continue          # 未显式开启：不注册，入站请求会被拒绝
             registry.register(WebhookChannel(item.id or item.type, item.options))
     return registry

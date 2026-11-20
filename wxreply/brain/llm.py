@@ -46,7 +46,8 @@ class LLMClient:
         }
         working = list(messages)
         tool_rounds = 0
-        for attempt in range(retries + 1):
+        network_attempt = 0          # 只有"网络/限流失败"消耗这个预算
+        while network_attempt <= retries:
             payload: Dict[str, Any] = {
                 "model": self.config.model,
                 "messages": working,
@@ -60,11 +61,15 @@ class LLMClient:
                 response = requests.post(url, json=payload, headers=headers, timeout=self.config.timeout_s)
                 if response.status_code >= 400:
                     if tools and response.status_code in (400, 422):
-                        tools = None  # 模型不支持工具，退回普通对话
+                        tools = None  # 模型不支持工具，退回普通对话（不消耗重试预算）
                         working = list(messages)
                         continue
                     if response.status_code in (429, 500, 502, 503):
-                        time.sleep(1.5 * (attempt + 1))
+                        network_attempt += 1
+                        if network_attempt > retries:
+                            return LLMResult("", self.config.model, int((time.time() - start) * 1000),
+                                             error=f"HTTP {response.status_code}: 重试耗尽")
+                        time.sleep(1.5 * network_attempt)
                         continue
                     return LLMResult("", self.config.model, int((time.time() - start) * 1000),
                                      error=f"HTTP {response.status_code}: {response.text[:200]}")
@@ -72,7 +77,7 @@ class LLMClient:
                 message = (data.get("choices") or [{}])[0].get("message", {}) or {}
                 calls = message.get("tool_calls") or []
                 if calls and executor and tool_rounds < 4:
-                    tool_rounds += 1
+                    tool_rounds += 1          # 工具轮次单独计数，不占网络重试次数
                     working.append({
                         "role": "assistant",
                         "content": message.get("content") or "",
@@ -98,9 +103,10 @@ class LLMClient:
                 return LLMResult(text.strip(), self.config.model,
                                  int((time.time() - start) * 1000), tool_calls=tool_rounds)
             except Exception as exc:
-                if attempt >= retries:
+                network_attempt += 1
+                if network_attempt > retries:
                     return LLMResult("", self.config.model, int((time.time() - start) * 1000), error=str(exc))
-                time.sleep(1.0 * (attempt + 1))
+                time.sleep(1.0 * network_attempt)
         return LLMResult("", self.config.model, int((time.time() - start) * 1000), error="重试耗尽")
 
     def _dry_reply(self, messages: List[Dict[str, Any]]) -> str:

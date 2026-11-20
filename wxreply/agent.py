@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -97,7 +98,10 @@ class Agent:
         )
         self.vision = VisionClient(config.ai)
         self.embeddings = EmbeddingClient(
-            config.ai.embedding_model, config.ai.base_url, config.ai.api_key,
+            config.ai.embedding_model,
+            config.ai.embedding_base_url or config.ai.base_url,
+            config.ai.embedding_api_key or config.ai._fallback_key(
+                config.ai.embedding_base_url or config.ai.base_url),
             config.resolve(config.rag.embedding_cache),
         )
         self.kb = KnowledgeBase(config.resolve(config.kb_dir), config.rag.mode, self.embeddings)
@@ -172,8 +176,12 @@ class Agent:
         self._deep_page: Optional[int] = None
         self._last_error: str = ""
         self._reading: set = set()
+        self.last_scan_ts: float = 0.0
+        self.last_cycle_error: str = ""
         # 重启后恢复待重试队列（与发送台账同库）
         self._load_retries()
+        if self.handoff.corrupt:
+            self.emit("error", message="人工接管状态文件损坏：自动发送已暂停，请检查 data/handoff.json")
 
     # ---------- 运行控制 ----------
     def set_dry_run(self, value: bool) -> None:
@@ -342,10 +350,11 @@ class Agent:
                 self.pause()
             return 0
         regions = self.layout.regions(image.width, image.height)
+        self.last_scan_ts = time.time()
         try:
             self.sync_conversations()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.last_cycle_error = str(exc)
         # 先补做失败重试 / 限频后补发，再扫描新未读
         try:
             self.drive_pending_work()
@@ -1379,6 +1388,8 @@ class Agent:
     def send_gate(self, peer: str, manual: bool = False) -> Tuple[bool, str]:
         if self.dry_run:
             return False, "dry_run"
+        if self.handoff.corrupt:
+            return False, "handoff_corrupt"
         if not self.router.client.ready:
             return False, "model_not_ready"
         if not manual and self.handoff.is_taken(peer):
@@ -1611,8 +1622,9 @@ class Agent:
                 self._mark_event(peer, "retry", delay=60.0)
 
     def _flush_held(self) -> None:
-        """被限频/闸门挡住但已有草稿的会话：条件恢复后自动补发（先核对消息版本）。"""
-        for peer in list(self._pending.keys()):
+        """被限频/闸门挡住但已有草稿的会话：条件恢复后逐个补发（打开目标会话再校验版本）。"""
+        peers = [name for name in self._pending_order if name in self._pending]
+        for peer in peers:
             pending = self._pending.get(peer)
             if not pending or not pending.get("held_reason"):
                 continue
@@ -1621,9 +1633,14 @@ class Agent:
             ok, _reason = self.send_gate(peer)
             if not ok:
                 continue
-            latest = self._latest_incoming(peer)
-            if latest is None:
+            # 切到目标会话，重新截图，避免"当前开着别人"时用错截图
+            if not self.open_conversation(peer):
                 continue
+            image = self.platform.capture()
+            if image is None:
+                continue
+            regions = self.layout.regions(image.width, image.height)
+            latest = self._read_items(image, regions)
             if not latest:
                 self._drop_pending(peer)
                 continue
@@ -1633,18 +1650,29 @@ class Agent:
                 self._mark_event(peer, "retry", delay=1.0)
                 self.emit("skip", peer=peer, reason="草稿过期（客户有新消息），重新生成")
                 continue
+            pending["image"] = image
+            pending["regions"] = regions
             guard = self._make_guard(peer, signature)
-            outcome = self.sender.send(peer, pending["reply"], pending["image"],
-                                       pending["regions"], guard=guard)
+            outcome = self.sender.send(peer, pending["reply"], image, regions, guard=guard)
             self._finish_send(peer, pending["reply"], outcome, pending.get("incoming", ""),
                               pending.get("model", ""), pending.get("latency_ms", 0),
                               pending.get("event_key", ""), int(pending.get("event_seq") or 0))
-            return
+            time.sleep(0.3)      # 多客户公平补发，避免一次把窗口占满
 
     def _make_guard(self, peer: str, signature: str):
         def guard():
+            # 等待/粘贴前重新检查全部授权状态：暂停、关掉 live、移除白名单都必须能取消发送
+            if self.paused.is_set():
+                return "paused"
+            if self.dry_run or self.runtime.dry_run:
+                return "dry_run"
+            if self.handoff.corrupt:
+                return "handoff_corrupt"
             if self.handoff.is_taken(peer):
                 return "manual_takeover"
+            allowed, _matched = self.whitelist.matches_exact(peer)
+            if not allowed:
+                return "not_whitelisted"
             latest = self._latest_incoming(peer)
             if latest is None:
                 return None                 # 无法确认：交给 header / 输入框检查兜底
@@ -1763,6 +1791,7 @@ class Agent:
             "incoming_items": incoming, "history": history, "profile": profile,
             "tool_results": [result.as_dict() for result in tool_results], "is_group": is_group,
             "event_key": event_key, "event_seq": event_seq, "signature": signature,
+            "draft_id": uuid.uuid4().hex, "version": event_key,
         }
         if peer in self._pending_order:
             self._pending_order.remove(peer)
@@ -1831,8 +1860,13 @@ class Agent:
         if profile.get("summary"):
             system += f"\n【历史摘要】{profile['summary']}"
         if tool_results:
-            lines = "；".join(result.summary for result in tool_results)
-            system += f"\n【工具查询结果（可直接引用，不要编造）】{lines}"
+            ok_lines = [result.summary for result in tool_results if result.ok]
+            bad_lines = [result.summary for result in tool_results if not result.ok]
+            if ok_lines:
+                system += f"\n【工具查询结果（可直接引用，不要编造）】{'；'.join(ok_lines)}"
+            if bad_lines:
+                system += (f"\n【工具没有给出可靠结果，必须按下面的要求处理，不要编造价格/库存】"
+                           f"{'；'.join(bad_lines)}")
         if is_group:
             system += "\n当前是群聊：回复要简短，必要时点名对方，不要刷屏。"
         friend_persona = self._friend_persona(peer)
@@ -1860,15 +1894,15 @@ class Agent:
         result = self.router.client.chat(
             messages, tools=schemas, executor=self.tools.execute if schemas else None
         )
-        if self.router.client.dry_run and tool_results:
-            text = "（dry-run）根据工具查询：" + "；".join(r.summary for r in tool_results) + \
+        if self.router.client.dry_run and any(r.ok for r in tool_results):
+            text = "（dry-run）根据工具查询：" + "；".join(r.summary for r in tool_results if r.ok) + \
                    "。配置 api_key 后由模型润色成自然回复。"
             checked = self.guardrails.check_reply(text)
             if checked.action == "reply":
                 return checked.text, "dry-run", result.latency_ms
         if result.error or not result.text.strip():
-            if self.router.client.dry_run and tool_results:
-                text = "（dry-run）根据工具查询：" + "；".join(r.summary for r in tool_results) + \
+            if self.router.client.dry_run and any(r.ok for r in tool_results):
+                text = "（dry-run）根据工具查询：" + "；".join(r.summary for r in tool_results if r.ok) + \
                        "。配置 api_key 后由模型润色成自然回复。"
                 checked = self.guardrails.check_reply(text)
                 return (checked.text if checked.action == "reply" else None), "dry-run", result.latency_ms
@@ -1939,9 +1973,13 @@ class Agent:
             if not rows:
                 return
             text = "\n".join(f"{'对方' if d == 'in' else '我方'}：{t}" for _i, d, _k, t in rows)
+            old_summary = (self.memory.profile(peer).get("summary") or "").strip()
+            prompt_text = text[:4000]
+            if old_summary:
+                prompt_text = f"【已有摘要，必须保留其中的需求/报价/交期等事实】\n{old_summary}\n\n【新增消息】\n{prompt_text}"
             summary_prompt = [
-                {"role": "system", "content": "把下面的聊天压缩成 3 句话以内的客户档案摘要，保留需求、报价、交期、称呼。"},
-                {"role": "user", "content": text[:4000]},
+                {"role": "system", "content": "把下面的聊天合并成 3 句话以内的客户档案摘要：保留旧摘要里的关键事实，再补充新信息；不要丢掉已有的需求、报价、交期、称呼。"},
+                {"role": "user", "content": prompt_text},
             ]
             result = self.router.client.chat(summary_prompt, retries=0)
             if result.text and not result.error:
@@ -2274,12 +2312,14 @@ class Agent:
         return self.pending
 
     def approve_pending(self, text_override: Optional[str] = None,
-                        peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                        peer: Optional[str] = None,
+                        draft_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self.wx_lock:
-            return self._approve_pending_locked(text_override, peer)
+            return self._approve_pending_locked(text_override, peer, draft_id)
 
     def _approve_pending_locked(self, text_override: Optional[str] = None,
-                                peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                                peer: Optional[str] = None,
+                                draft_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         # 发送必须绑定到明确联系人：不再"没找到就回退到别人的草稿"
         if not peer:
             return {"ok": False, "status": "blocked",
@@ -2288,6 +2328,10 @@ class Agent:
         if not pending:
             return {"ok": False, "status": "blocked",
                     "detail": f"「{peer}」没有待发送草稿，拒绝跨会话发送", "peer": peer}
+        # 草稿 ID 绑定：前端拿着旧草稿（或别的会话的草稿）来发，一律拒绝
+        if draft_id and pending.get("draft_id") and draft_id != pending.get("draft_id"):
+            return {"ok": False, "status": "stale",
+                    "detail": "草稿已更新，请刷新后重新确认", "peer": peer}
         reply = (text_override or "").strip() or pending["reply"]
         checked = self.guardrails.check_reply(reply)
         if checked.action != "reply":
@@ -2368,6 +2412,15 @@ class Agent:
         self._pending.pop(peer, None)
         if peer in self._pending_order:
             self._pending_order.remove(peer)
+
+    def stop_sending(self) -> None:
+        """停止操作：取消所有待发任务，事件转为可重试，不会在恢复后突然发出去。"""
+        with self.wx_lock:
+            self.pause()
+            for peer in list(self._pending.keys()):
+                self._drop_pending(peer)
+                self._mark_event(peer, "retry", delay=30.0)
+            self.emit("status", message="已停止：待发任务全部取消")
 
     def discard_pending(self, peer: Optional[str] = None) -> None:
         target = self._resolve_pending(peer)

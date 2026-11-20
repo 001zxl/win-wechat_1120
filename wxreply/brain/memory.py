@@ -125,7 +125,13 @@ class MemoryStore:
 
     def needs_summary(self, peer: str) -> bool:
         profile = self.profile(peer)
-        return (self.last_id(peer) - profile["summarized_id"]) >= self.summarize_after
+        with self._lock:
+            row = self._db.execute(
+                "SELECT COUNT(*) FROM messages WHERE peer=? AND id>?",
+                (peer, profile["summarized_id"]),
+            ).fetchone()
+        # 只统计"这个客户"的新消息，别被其他客户的流量带偏
+        return int(row[0] or 0) >= self.summarize_after
 
     def pending_messages(self, peer: str) -> List[Tuple[int, str, str, str]]:
         profile = self.profile(peer)

@@ -46,6 +46,11 @@
     min-height: 0; height: 100%; overflow: hidden; }
   .card > .title { flex: none; }
   .card .title { font-size: 12px; color: #6b7280; padding: 10px 12px 6px; font-weight: 600; letter-spacing: .02em; }
+  /* 右栏两卡片纵向排布：人工队列固定高度，日志占剩余空间，主会话区不被挤压 */
+  .right-col { display: flex; flex-direction: column; gap: 10px; min-height: 0; height: 100%; }
+  .right-col .card { height: auto; }
+  .handoff-card { flex: 0 0 auto; max-height: 38%; }
+  .events-card { flex: 1 1 auto; min-height: 0; }
   #handoffs { flex: 0 1 auto; max-height: 34%; overflow-y: auto; padding: 0 10px 8px; }
   .handoff { border: 1px solid #f0f0f0; border-radius: 8px; padding: 8px; margin-bottom: 6px; background: #fffaf0; }
   .handoff-main { display: flex; align-items: baseline; gap: 6px; }
@@ -229,6 +234,7 @@
         <button class="primary" id="send">发送草稿</button>
         <button id="regen">重新生成</button>
         <button class="danger" id="takeover">转人工</button>
+        <button id="stopSend">取消待发</button>
         <button id="discard">丢弃草稿</button>
         <span class="spacer"></span>
         <span class="chip" id="draftMeta"></span>
@@ -240,15 +246,17 @@
     </div>
   </section>
 
-  <section class="card">
-    <div class="title">待人工处理</div>
-    <div id="handoffs"><div class="empty">暂无</div></div>
-  </section>
+  <aside class="right-col">
+    <section class="card handoff-card">
+      <div class="title">待人工处理</div>
+      <div id="handoffs"><div class="empty">暂无</div></div>
+    </section>
 
-  <section class="card">
-    <div class="title">工作进度</div>
-    <div id="events"><div class="empty">启动中…</div></div>
-  </section>
+    <section class="card events-card">
+      <div class="title">工作进度</div>
+      <div id="events"><div class="empty">启动中…</div></div>
+    </section>
+  </aside>
 </main>
 
 <div class="modal-mask" id="simulateModal">
@@ -363,7 +371,7 @@ function renderChips(s) {
     chip(`工具 ${s.tools ? "开" : "关"}`),
     s.group ? chip("群聊放行", "on") : chip("群聊关闭", ""),
     chip(`人设 ${s.persona}`),
-    chip(`知识库 ${s.kb} 块`),
+    chip(`知识库 ${s.kb} 块 · v${s.kb_version || "-"}`),
     chip(`白名单 ${s.whitelist}`),
   ];
   $("chips").innerHTML = parts.join("");
@@ -424,6 +432,10 @@ function renderConversations(convs, current) {
   document.querySelectorAll(".conv").forEach((el) => {
     el.onclick = () => {
       selected = el.dataset.peer;
+      // 立刻清空编辑器并禁用发送：避免上一位客户的草稿被当成新客户的内容发出去
+      draftKey = "";
+      if ($("draft")) $("draft").value = "";
+      ["send", "regen", "discard"].forEach((id) => { if ($(id)) $(id).disabled = true; });
       act("select", { peer: selected });
     };
   });
@@ -483,15 +495,17 @@ function renderChat() {
 function renderDraft() {
   const pending = state && state.pending;
   const mine = pending && pending.peer === selected;
-  const key = mine ? pending.peer + "|" + pending.reply : "";
+  const key = mine ? pending.peer + "|" + (pending.draft_id || "") + "|" + pending.reply : "";
   if (mine && key !== draftKey) {
     $("draft").value = pending.reply;
     draftKey = key;
     $("draftMeta").textContent = `${pending.model} · ${pending.latency_ms}ms`;
   }
   if (!mine) {
+    // 没有当前客户的草稿：清空编辑器，别让上一位客户的内容留在框里
+    $("draft").value = "";
     $("draftMeta").textContent = "";
-    if (draftKey) { draftKey = ""; }
+    draftKey = "";
   }
   ["send", "regen", "discard"].forEach((id) => { $(id).disabled = !mine; });
   const taken = !!(state && state.status && (state.status.handoffs || [])
@@ -948,7 +962,12 @@ $("calSave").onclick = saveLayout;
 $("pause").onclick = () => act("pause", { paused: !(state && state.status.paused) });
 $("live").onchange = (event) => act("live", { live: event.target.checked });
 $("send").onclick = async () => {
-  const result = await act("approve", { text: $("draft").value, peer: selected });
+  const pending = (state && state.pending && state.pending.peer === selected) ? state.pending : null;
+  const result = await act("approve", {
+    text: $("draft").value,
+    peer: selected,
+    draft_id: pending ? pending.draft_id : "",
+  });
   const info = result && result.result;
   if (!result || !result.ok) {
     alert("发送失败：" + ((info && (info.detail || info.status)) || "没有可发送的草稿（请先在左栏选中对应会话）"));
@@ -958,6 +977,11 @@ $("send").onclick = async () => {
 };
 $("regen").onclick = () => act("regen");
 $("discard").onclick = () => act("discard");
+$("stopSend").onclick = async () => {
+  const result = await act("stop");
+  if (!result || !result.ok) alert("取消失败");
+  fetchState();
+};
 $("takeover").onclick = async () => {
   if (!selected) { alert("请先在左栏选中一个会话"); return; }
   const taken = !!(state && state.status && (state.status.handoffs || [])
@@ -968,7 +992,7 @@ $("takeover").onclick = async () => {
 };
 $("apply").onclick = () => act("instruction", { text: $("instruction").value });
 $("draft").addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) act("approve", { text: $("draft").value });
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) $("send").click();
 });
 
 setupConvScrollbar();

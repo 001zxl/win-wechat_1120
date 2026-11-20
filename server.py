@@ -190,6 +190,7 @@ class ConsoleState:
                     "memory": self.cfg.memory.db_path,
                     "whitelist_names": list(self.cfg.safety.whitelist),
                     "handoffs": self.agent.handoff.items(),
+                    "handoff_corrupt": bool(self.agent.handoff.corrupt),
                     "layout": self.agent.layout_ratios(),
                     "vision_model": self.cfg.ai.vision_model,
                     "embedding_model": self.cfg.ai.embedding_model,
@@ -197,6 +198,7 @@ class ConsoleState:
                     "ocr": self.agent.ocr.available,
                     "persona": self.agent.persona.display_name,
                     "kb": self.agent.kb.size,
+                    "kb_version": self.agent.kb.version,
                     "whitelist": len(self.cfg.safety.whitelist),
                     "llm_ready": self.agent.router.client.ready,
                 },
@@ -261,7 +263,8 @@ class ConsoleState:
                 if not peer:
                     return {"ok": False, "error": "必须指定联系人（草稿与联系人绑定）",
                             "result": None}
-                result = self.agent.approve_pending(payload.get("text"), peer=peer)
+                result = self.agent.approve_pending(payload.get("text"), peer=peer,
+                                                    draft_id=payload.get("draft_id"))
                 return {"ok": bool(result and result.get("ok")), "result": result}
             if action == "regen":
                 result = self.agent.regenerate_pending(peer=self.selected)
@@ -274,6 +277,9 @@ class ConsoleState:
                     self.agent.pause()
                 else:
                     self.agent.resume()
+                return {"ok": True}
+            if action == "stop":
+                self.agent.stop_sending()
                 return {"ok": True}
             if action == "live":
                 self.agent.set_dry_run(not bool(payload.get("live")))
@@ -299,6 +305,10 @@ class ConsoleState:
                 return {"ok": self.agent.release_handoff(peer), "peer": peer}
             if action == "handoffs":
                 return {"ok": True, "items": self.agent.handoff.items()}
+            if action == "kb_reload":
+                docs = self.agent.kb.reload()
+                self.agent.emit("status", message=f"知识库已重新加载：{docs} 段，版本 {self.agent.kb.version}")
+                return {"ok": True, "docs": docs, "version": self.agent.kb.version}
             if action == "offscreen":
                 platform = self.agent.platform
                 if not (hasattr(platform, "mount_offscreen") and hasattr(platform, "restore_from_offscreen")):
@@ -395,7 +405,17 @@ def make_handler(state: ConsoleState):
                            "application/json; charset=utf-8")
                 return
             if path == "/api/health":
-                self._send(200, b'{"ok":true}', "application/json")
+                worker = getattr(state, "worker", None)
+                alive = bool(worker and worker.is_alive())
+                last = float(getattr(state.agent, "last_scan_ts", 0) or 0)
+                payload = {
+                    "ok": alive,
+                    "worker": alive,
+                    "last_scan_age": round(time.time() - last, 1) if last else None,
+                }
+                self._send(200 if alive else 503,
+                           json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                           "application/json; charset=utf-8")
                 return
             if path == "/api/avatar":
                 query = parse_qs(urlparse(self.path).query)
@@ -498,9 +518,11 @@ def make_handler(state: ConsoleState):
             if host not in ("127.0.0.1", "localhost", "[::1]", "::1"):
                 return False
             origin = (self.headers.get("Origin") or "").strip().lower()
-            if origin and not any(origin.startswith(prefix) for prefix in (
-                    "http://127.0.0.1", "http://localhost", "http://[::1]")):
-                return False
+            if origin:
+                parsed = urlparse(origin)
+                if parsed.scheme not in ("http", "https") or \
+                        (parsed.hostname or "") not in ("127.0.0.1", "localhost", "::1"):
+                    return False
             token = os.environ.get("WX_CONSOLE_TOKEN", "").strip()
             if token and (self.headers.get("X-Console-Token") or "").strip() != token:
                 return False

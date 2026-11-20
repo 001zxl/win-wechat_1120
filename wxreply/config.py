@@ -29,10 +29,19 @@ class AIConfig:
     model_keys: Dict[str, str] = field(default_factory=dict)  # 控制台里按模型填的 key
     vision_model: str = ""                             # 图片理解用的视觉模型
     vision_base_url: str = ""
+    vision_api_key: str = ""                           # 视觉单独凭据；空则仅在同网关时复用聊天 key
     embedding_model: str = ""                          # 向量检索用的 embedding 模型
+    embedding_base_url: str = ""
+    embedding_api_key: str = ""
     temperature: float = 0.7
     max_tokens: int = 300
     timeout_s: float = 30.0
+
+    def _fallback_key(self, base_url: str) -> str:
+        """只有同一个网关时才允许复用聊天 key，避免 A 家 key 被发给 B 家。"""
+        if base_url and base_url.rstrip("/") != (self.base_url or "").rstrip("/"):
+            return ""
+        return self.api_key
 
     def options(self) -> List[ModelOption]:
         result: List[ModelOption] = []
@@ -42,15 +51,21 @@ class AIConfig:
             elif isinstance(item, dict):
                 model = str(item.get("model") or item.get("id") or "")
                 option_id = str(item.get("id") or model)
+                base_url = str(item.get("base_url") or "")
+                # 凭据按供应商隔离：只认这个模型自己的 key（含控制台填写的），不再"继承"全局 key
+                api_key = str(item.get("api_key") or self.model_keys.get(option_id) or "")
+                if not api_key and (not base_url or base_url.rstrip("/") == (self.base_url or "").rstrip("/")):
+                    api_key = self.model_keys.get(self.model) or ""
                 result.append(ModelOption(
                     id=option_id,
                     label=str(item.get("label") or model),
                     model=model,
-                    base_url=str(item.get("base_url") or ""),
-                    api_key=str(item.get("api_key") or self.model_keys.get(option_id) or self.api_key or ""),
+                    base_url=base_url,
+                    api_key=api_key,
                 ))
         if not result:
-            result = [ModelOption(id=self.model, label=self.model, model=self.model)]
+            result = [ModelOption(id=self.model, label=self.model, model=self.model,
+                                  base_url=self.base_url, api_key=self.api_key)]
         return result
 
     def apply_option(self, option: ModelOption) -> None:
@@ -58,7 +73,7 @@ class AIConfig:
             self.model = option.model
         if option.base_url:
             self.base_url = option.base_url
-        self.api_key = option.api_key or self.api_key
+        self.api_key = option.api_key or ""
 
 
 @dataclass
@@ -239,6 +254,11 @@ def _apply_settings_overlay(cfg: Config) -> None:
     keys = data.get("api_keys") or {}
     if isinstance(keys, dict):
         cfg.ai.model_keys = {str(k): str(v) for k, v in keys.items() if v}
+        # 视觉 / Embedding 的独立凭据（控制台用 "vision"/"embedding" 作为 key 名）
+        if keys.get("vision"):
+            cfg.ai.vision_api_key = str(keys["vision"])
+        if keys.get("embedding"):
+            cfg.ai.embedding_api_key = str(keys["embedding"])
     whitelist = data.get("whitelist")
     if isinstance(whitelist, list):
         cfg.safety.whitelist = [str(item) for item in whitelist if str(item).strip()]
