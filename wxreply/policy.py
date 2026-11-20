@@ -91,6 +91,21 @@ class Whitelist:
         self.names = [name for name in (names or []) if name.strip()]
         self.allow_group_chat = allow_group_chat
 
+    def matches_exact(self, peer_text: Optional[str]) -> Tuple[bool, Optional[str]]:
+        """自动发送授权用的白名单：只接受归一化后完全相等。
+
+        OCR 把名字读少一个字（张三 vs 张三丰）只能作为人工确认的候选，不能直接放行。
+        """
+        normalized = normalize_name(peer_text)
+        if not normalized:
+            return False, None
+        if is_group_name(peer_text) and not self.allow_group_chat:
+            return False, None
+        for name in self.names:
+            if normalize_name(name) == normalized:
+                return True, name
+        return False, None
+
     def matches(self, peer_text: Optional[str]) -> Tuple[bool, Optional[str]]:
         if not normalize_name(peer_text):
             return False, None

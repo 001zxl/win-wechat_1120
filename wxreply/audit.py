@@ -53,10 +53,18 @@ class AuditStore:
                     text TEXT,
                     state TEXT,
                     detail TEXT,
-                    evidence TEXT
+                    evidence TEXT,
+                    event INTEGER DEFAULT 0
                 )
                 """
             )
+            try:
+                columns = [row[1] for row in
+                           self._connection.execute("PRAGMA table_info(sends)").fetchall()]
+                if "event" not in columns:
+                    self._connection.execute("ALTER TABLE sends ADD COLUMN event INTEGER DEFAULT 0")
+            except Exception:
+                pass
             self._connection.commit()
 
     def record(
@@ -102,15 +110,25 @@ class AuditStore:
             self._connection.commit()
 
     def record_send(self, peer: str, signature: str, text: str, state: str,
-                    detail: str = "", evidence: str = "") -> None:
-        """发送台账：用于幂等（同一批消息不重复发）与「状态不明」人工核查。"""
+                    detail: str = "", evidence: str = "", event: int = 0) -> None:
+        """发送台账：按「会话 + 消息内容 + 轮次」记账，同一事件不重复发，新事件照常处理。"""
         with self._lock:
             self._connection.execute(
-                "INSERT INTO sends (ts, peer, signature, text, state, detail, evidence) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (time.time(), peer, signature, text, state, detail, evidence),
+                "INSERT INTO sends (ts, peer, signature, text, state, detail, evidence, event) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), peer, signature, text, state, detail, evidence, int(event)),
             )
             self._connection.commit()
+
+    def max_event(self, peer: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT COALESCE(MAX(event), 0) FROM sends WHERE peer = ?", (peer,)
+            ).fetchone()
+        try:
+            return int(row[0] or 0)
+        except Exception:
+            return 0
 
     def find_send(self, peer: str, signature: str):
         with self._lock:

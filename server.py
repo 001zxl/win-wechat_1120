@@ -257,10 +257,11 @@ class ConsoleState:
                     return {"ok": True, "reading": True}
                 return {"ok": False, "error": "unknown peer"}
             if action == "approve":
-                peer = payload.get("peer") or self.selected
+                peer = str(payload.get("peer") or self.selected or "")
+                if not peer:
+                    return {"ok": False, "error": "必须指定联系人（草稿与联系人绑定）",
+                            "result": None}
                 result = self.agent.approve_pending(payload.get("text"), peer=peer)
-                if result is None and self.agent.pending:
-                    result = self.agent.approve_pending(payload.get("text"))
                 return {"ok": bool(result and result.get("ok")), "result": result}
             if action == "regen":
                 result = self.agent.regenerate_pending(peer=self.selected)

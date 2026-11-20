@@ -136,6 +136,8 @@ class SafeSender:
 
         attempts = max(1, int(runtime.send_retries) + 1)
         last = SendResult(SendOutcome("uncertain", "no_attempt"), header=header)
+        # 发送前的「最后一条我方消息」快照：只有它发生变化才算本次发送产生了新气泡
+        pre_structured = self.platform.last_outgoing_text()
         for _attempt in range(attempts):
             original_foreground = self.platform.get_foreground()
             if not self.platform.focus(window):
@@ -193,18 +195,17 @@ class SafeSender:
                 break
 
             changed = changed_ratio(pre_image, post_image, regions)
+            # 证据必须来自“本次新增”：结构化通道要求最后一条我方消息在发送前后发生变化
             structured = self.platform.last_outgoing_text()
-            if structured is not None and self._similar(structured, text):
+            if structured is not None and structured != pre_structured \
+                    and self._same_text(structured, text):
                 self.risk.record(peer)
                 return SendResult(SendOutcome("verified", "bubble_confirmed"), header=header, changed=changed)
             if self._verify_new_bubble(pre_image, post_image, regions, text):
                 self.risk.record(peer)
                 return SendResult(SendOutcome("verified", "bubble_confirmed"), header=header, changed=changed)
-            if self._confirm_by_readback(text, post_image, regions):
-                self.risk.record(peer)
-                return SendResult(SendOutcome("verified", "readback_confirmed"), header=header, changed=changed)
 
-            # 没看到「本次新增且内容相符」的我方气泡 —— 不重发，标记不确定交人工
+            # 没有「本次新增」的证据：不再用历史文本升级为成功，保持不确定交人工
             last = SendResult(SendOutcome("uncertain", f"bubble_not_confirmed changed={changed:.4f}"),
                               header=header, changed=changed)
             break
@@ -235,32 +236,27 @@ class SafeSender:
         before = self._outgoing_texts(pre_image, regions)
         after = self._outgoing_texts(post_image, regions)
 
-        def count_similar(lines) -> int:
-            return sum(1 for line in lines if self._similar(line, text))
+        def count_same(lines) -> int:
+            return sum(1 for line in lines if self._same_text(line, text))
 
         # 「同样内容的我方气泡」出现次数变多，才算本次新增
-        return count_similar(after) > count_similar(before)
+        return count_same(after) > count_same(before)
+
+    @staticmethod
+    def _same_text(a: str, b: str) -> bool:
+        """比 _similar 更严：必须足够接近，且不允许"旧消息短、新回复长"的包含关系蒙混过关。"""
+        left, right = _flat(a), _flat(b)
+        if not left or not right:
+            return False
+        if left == right:
+            return True
+        longest = max(len(left), len(right))
+        if abs(len(left) - len(right)) > max(2, int(longest * 0.3)):
+            return False
+        return difflib.SequenceMatcher(None, left, right).ratio() >= 0.85
 
 
-    # ---------- 读回确认（失败重试前的幂等检查） ----------
-    def _confirm_by_readback(self, text: str, image, regions: Regions) -> bool:
-        structured = self.platform.last_outgoing_text()
-        if structured is not None:
-            return self._similar(structured, text)
-        if self.ocr is None or not self.ocr.available:
-            return False
-        try:
-            lines = self.ocr.recognize(image.crop(regions.messages))
-        except Exception:
-            return False
-        offset_x = regions.messages[0]
-        for line in lines:
-            x1, y1, x2, y2 = line.bbox
-            line.bbox = (x1 + offset_x, y1 + regions.messages[1], x2 + offset_x, y2 + regions.messages[1])
-        chat_left, _top, chat_right, _bottom = regions.chat
-        width = max(1, chat_right - chat_left)
-        outgoing = [line.text for line in lines if (line.center[0] - chat_left) / width >= 0.55]
-        return any(self._similar(line, text) for line in outgoing[-6:])
+    # 说明：历史文本不能作为「本次发送成功」的证据，已删除 _confirm_by_readback 兜底路径。
 
     @staticmethod
     def _similar(a: str, b: str) -> bool:
