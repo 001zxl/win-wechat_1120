@@ -1099,7 +1099,10 @@ class Agent:
 
     def _describe_media(self, item: MessageItem) -> None:
         """明确区分：已检测 / 已取得文件 / 理解成功 / 理解失败 / 没有视觉能力。"""
-        if not item.media_path:
+        if item.media_path == "" and item.description:
+            # 结构化通道可能直接给描述（例如接入层已做 OCR/转写）：这就是"理解成功"
+            item.media_state = "understood"
+        elif not item.media_path:
             item.media_state = "detected"
             item.description = "（检测到图片，但没有取到图片文件）"
         elif not self.vision.available:
