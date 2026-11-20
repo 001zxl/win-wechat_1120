@@ -1,0 +1,918 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>微信 AI 回复 · 控制台</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #eef0f3; color: #1f1f1f;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    background: #fff; border-bottom: 1px solid #e3e6ea; flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+  header h1 { white-space: nowrap; flex: none; }
+  header button { white-space: nowrap; flex: none; }
+  header .chips { flex-wrap: nowrap; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 700; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    font-size: 12px; padding: 3px 8px; border-radius: 999px;
+    background: #f2f4f7; color: #4b5563; white-space: nowrap;
+  }
+  .chip.on { background: #e7f8ec; color: #0b7a3e; }
+  .chip.warn { background: #fff4e5; color: #ad6800; }
+  select {
+    border: 0; background: transparent; font-size: 12px; color: #1f1f1f;
+    font-family: inherit; outline: none; cursor: pointer; max-width: 150px;
+  }
+  .spacer { flex: 1; }
+  button {
+    border: 0; border-radius: 8px; padding: 7px 12px; font-size: 13px;
+    cursor: pointer; background: #eef1f4; color: #1f1f1f;
+  }
+  button:hover { filter: brightness(0.97); }
+  button.primary { background: #07c160; color: #fff; }
+  button.danger { background: #fff1f0; color: #cf1322; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  main { flex: 1; display: grid; grid-template-columns: 300px 1fr 320px;
+    grid-template-rows: minmax(0, 1fr); gap: 10px; padding: 10px; min-height: 0; overflow: hidden; }
+  .card { background: #fff; border-radius: 12px; display: flex; flex-direction: column;
+    min-height: 0; height: 100%; overflow: hidden; }
+  .card > .title { flex: none; }
+  .card .title { font-size: 12px; color: #6b7280; padding: 10px 12px 6px; font-weight: 600; letter-spacing: .02em; }
+  .conv-scroll { flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden; }
+  #conversations { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 4px 8px 8px;
+    overscroll-behavior: contain; scrollbar-width: none; }
+  #conversations::-webkit-scrollbar { display: none; width: 0; height: 0; }
+  .custom-scroll { flex: none; width: 12px; position: relative; margin: 0 2px 8px 0;
+    background: #f2f4f7; border-radius: 6px; cursor: pointer; }
+  .custom-thumb { position: absolute; left: 2px; right: 2px; top: 0; height: 40px;
+    background: #b9c1cb; border-radius: 4px; cursor: grab; transition: background .15s; }
+  .custom-thumb:hover { background: #8f99a6; }
+  .custom-thumb.dragging { background: #6b7684; cursor: grabbing; }
+  .conv {
+    display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 9px;
+    cursor: pointer; margin-bottom: 3px;
+  }
+  .conv:hover { background: #f5f7f9; }
+  .conv.active { background: #e7f8ec; }
+  .avatar {
+    width: 36px; height: 36px; border-radius: 8px; flex: none;
+    background: linear-gradient(135deg, #cfd8e3, #aab7c6);
+    display: flex; align-items: center; justify-content: center; color: #fff; font-size: 13px;
+    overflow: hidden;
+  }
+  .avatar { position: relative; }
+  .avatar .letter { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  .avatar img { position: relative; z-index: 1; width: 100%; height: 100%; object-fit: cover; display: block; border-radius: 8px; }
+  .conv-time { margin-left: auto; font-size: 10px; color: #9aa4b2; white-space: nowrap; padding-left: 6px; }
+  .conv .meta { flex: 1; min-width: 0; }
+  .conv .name { font-size: 13px; font-weight: 600; display: flex; gap: 6px; align-items: center;
+    white-space: nowrap; overflow: hidden; }
+  .conv .name > span:first-child, .conv .name .peer-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .badge { background: #fa5151; color: #fff; font-size: 10px; border-radius: 999px; padding: 1px 6px; }
+  .conv .status { font-size: 11px; color: #8a94a6; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .center { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  .peer-title { display: flex; align-items: center; gap: 8px; }
+  .peer-avatar { width: 26px; height: 26px; border-radius: 7px; object-fit: cover; }
+  .peer-title { font-size: 14px; font-weight: 700; padding: 12px 16px; border-bottom: 1px solid #eef1f4; display: flex; gap: 8px; align-items: center; }
+  #chat { flex: 1 1 0; min-height: 0; overflow-y: scroll; padding: 14px 16px; background: #f7f8fa;
+    scrollbar-gutter: stable; }
+  #chat::-webkit-scrollbar { width: 10px; }
+  #chat::-webkit-scrollbar-track { background: #eef1f4; }
+  #chat::-webkit-scrollbar-thumb { background: #c2c9d2; border-radius: 5px; border: 2px solid #eef1f4; }
+  .compose { flex: none; }
+  .row { display: flex; margin-bottom: 10px; }
+  .row.out { justify-content: flex-end; }
+  .bubble {
+    max-width: 72%; padding: 9px 12px; border-radius: 10px; font-size: 13px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .row.in .bubble { background: #fff; border: 1px solid #e8ebef; }
+  .row.out .bubble { background: #95ec69; }
+  .row.draft .bubble { background: #fff7d6; border: 1px dashed #e8c34a; color: #7a5b00; }
+  .bubble .tag { display: block; font-size: 10px; opacity: .65; margin-bottom: 3px; }
+  .compose { border-top: 1px solid #eef1f4; padding: 10px 14px 12px; background: #fff; }
+  .compose textarea {
+    width: 100%; height: 64px; resize: vertical; border: 1px solid #dfe3e8; border-radius: 9px;
+    padding: 9px 10px; font-size: 13px; font-family: inherit; outline: none;
+  }
+  .compose textarea:focus { border-color: #07c160; }
+  .compose .row2 { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
+  .compose input[type=text] {
+    flex: 1; border: 1px solid #dfe3e8; border-radius: 8px; padding: 7px 9px; font-size: 12px;
+  }
+  #events { flex: 1 1 auto; min-height: 0; overflow-y: scroll; padding: 0 10px 10px; font-size: 12px; }
+  #events::-webkit-scrollbar { width: 10px; }
+  #events::-webkit-scrollbar-track { background: #f2f4f7; }
+  #events::-webkit-scrollbar-thumb { background: #c2c9d2; border-radius: 5px; }
+  .event { padding: 6px 8px; border-radius: 7px; margin-bottom: 5px; background: #fafbfc; color: #475467; line-height: 1.5; }
+  .event.draft { background: #fffbe6; color: #7a5b00; }
+  .event.sent { background: #e7f8ec; color: #0b7a3e; }
+  .event.skip, .event.rate_limited { background: #f6f6f6; color: #8a94a6; }
+  .event.escalate, .event.blocked { background: #fff4e5; color: #ad6800; }
+  .event.error { background: #fff1f0; color: #cf1322; }
+  .event.tool { background: #eef4ff; color: #1d39c4; }
+  .event.media { background: #f0f5ff; color: #2f54eb; }
+  .event.memory { background: #f9f0ff; color: #531dab; }
+  .event.model { background: #e6fffb; color: #08979c; }
+  .event.group { background: #f6ffed; color: #237804; }
+  .event .ts { color: #9aa4b2; font-size: 10px; margin-right: 5px; }
+  footer {
+    padding: 7px 16px; background: #e9ecef; color: #5b6472; font-size: 12px;
+    display: flex; gap: 14px; flex-wrap: wrap;
+  }
+  .empty { color: #98a2b3; font-size: 12px; padding: 16px; text-align: center; }
+  .wl-box { flex: none; padding: 0 10px 10px; }
+  .wl-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; min-height: 24px; }
+  .wl-chip { background: #e7f8ec; color: #0b7a3e; border-radius: 999px; padding: 3px 8px; font-size: 12px; display: flex; gap: 4px; align-items: center; }
+  .wl-chip b { cursor: pointer; font-weight: 400; opacity: .7; }
+  .wl-add { display: flex; gap: 6px; }
+  .wl-add input { flex: 1; border: 1px solid #dfe3e8; border-radius: 8px; padding: 5px 8px; font-size: 12px; min-width: 0; }
+  .wl-add button { padding: 5px 10px; }
+  .modal-mask { position: fixed; inset: 0; background: rgba(15, 23, 42, .35); display: none; align-items: center; justify-content: center; z-index: 50; }
+  .modal-mask.open { display: flex; }
+  .modal-card { background: #fff; border-radius: 14px; width: 760px; max-width: 92vw; max-height: 88vh; overflow: auto; padding: 18px 20px; box-shadow: 0 24px 60px rgba(0,0,0,.25); }
+  .modal-card h2 { font-size: 16px; margin: 0 0 4px; }
+  .modal-card .hint { color: #8a94a6; font-size: 12px; margin-bottom: 14px; }
+  .key-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .key-row label { width: 150px; font-size: 13px; }
+  .key-row input { flex: 1; border: 1px solid #dfe3e8; border-radius: 8px; padding: 6px 9px; font-size: 12px; }
+  .key-row .state { width: 58px; font-size: 11px; color: #8a94a6; text-align: right; }
+  .key-row .state.ok { color: #0b7a3e; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+  .cal-wrap { position: relative; display: inline-block; max-width: 100%; }
+  .cal-wrap img { max-width: 100%; border-radius: 8px; display: block; }
+  .cal-wrap canvas { position: absolute; left: 0; top: 0; }
+  .cal-sliders { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 18px; margin-top: 10px; }
+  .cal-sliders label { font-size: 12px; color: #475467; display: flex; align-items: center; gap: 8px; }
+  .cal-sliders input[type=range] { flex: 1; }
+  .cal-sliders span { width: 46px; text-align: right; font-variant-numeric: tabular-nums; }
+  .setup-item { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border-radius: 10px; margin-bottom: 8px; background: #fafbfc; }
+  .setup-item.ok { background: #f2fbf5; }
+  .setup-item.bad { background: #fff7f7; }
+  .setup-icon { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; flex: none; }
+  .setup-item.ok .setup-icon { background: #07c160; color: #fff; }
+  .setup-item.bad .setup-icon { background: #fa5151; color: #fff; }
+  .setup-body { flex: 1; }
+  .setup-label { font-size: 13px; font-weight: 600; }
+  .setup-hint { font-size: 12px; color: #8a94a6; margin-top: 2px; }
+  .setup-item button { flex: none; }
+  .wl-quick { margin-left: auto; font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #eef4ff; color: #1d39c4; }
+  .conv { position: relative; }
+</style>
+</head>
+<body>
+<header>
+  <h1>微信 AI 回复 · 控制台</h1>
+  <label class="chip" style="display:flex;align-items:center;gap:6px">模型
+    <select id="modelSelect"></select>
+  </label>
+  <span class="chip warn" id="modelKeyHint" style="display:none">缺 Key</span>
+  <div class="chips" id="chips"></div>
+  <div class="spacer"></div>
+  <button id="pause">暂停</button>
+  <label class="chip" style="cursor:pointer">
+    <input type="checkbox" id="live" style="vertical-align:-2px" /> 允许真实发送
+  </label>
+  <button id="btnSync">同步会话</button>
+  <button id="btnReadCurrent">读取当前会话</button>
+  <button id="btnSimulate">模拟测试</button>
+  <button id="btnOffscreen" style="display:none">离屏隐藏</button>
+  <button id="btnProcess">处理当前会话</button>
+  <button id="btnSetup">启动检查</button>
+  <button id="btnSettings">设置</button>
+  <button id="btnCalibrate">校准布局</button>
+</header>
+
+<main>
+  <section class="card">
+    <div class="title">会话</div>
+    <div class="conv-scroll">
+      <div id="conversations"></div>
+      <div class="custom-scroll" id="convScrollbar">
+        <div class="custom-thumb" id="convThumb"></div>
+      </div>
+    </div>
+    <div class="title" style="border-top:1px solid #eef1f4;padding-top:8px">白名单</div>
+    <div class="wl-box">
+      <div class="wl-chips" id="whitelist"></div>
+      <div class="wl-add">
+        <input id="wlInput" placeholder="输入微信显示名后回车" />
+        <button id="wlAdd">添加</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card center">
+    <div class="peer-title">
+      <img id="peerAvatar" class="peer-avatar" alt="" style="display:none" />
+      <span id="peerTitle">未选择会话</span>
+    </div>
+    <div id="chat"><div class="empty">等待未读消息…</div></div>
+    <div class="compose">
+      <textarea id="draft" placeholder="AI 草稿会出现在这里，可编辑后发送"></textarea>
+      <div class="row2">
+        <button class="primary" id="send">发送草稿</button>
+        <button id="regen">重新生成</button>
+        <button class="danger" id="discard">转人工 / 丢弃</button>
+        <span class="spacer"></span>
+        <span class="chip" id="draftMeta"></span>
+      </div>
+      <div class="row2">
+        <input type="text" id="instruction" placeholder="给 AI 的补充要求（重新生成时生效），如：这次语气更热情一点" />
+        <button id="apply">应用要求</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="title">工作进度</div>
+    <div id="events"><div class="empty">启动中…</div></div>
+  </section>
+</main>
+
+<div class="modal-mask" id="simulateModal">
+  <div class="modal-card" style="width:640px">
+    <h2>模拟客户来消息</h2>
+    <div class="hint">完全在项目内运行：不会点击、不会发送到真实微信。用于验证「接待 → 思考 → 回复」链路。</div>
+    <div class="key-row">
+      <label>客户/会话</label>
+      <input id="simPeer" list="simPeerList" placeholder="输入客户名，或从同步的会话里选" />
+      <datalist id="simPeerList"></datalist>
+    </div>
+    <div class="key-row" style="align-items:flex-start">
+      <label style="padding-top:6px">客户消息</label>
+      <textarea id="simText" style="flex:1;height:90px;border:1px solid #dfe3e8;border-radius:8px;padding:8px 10px;font-size:13px;font-family:inherit"></textarea>
+    </div>
+    <div class="key-row">
+      <label>示例</label>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button data-sim="FT-120 折叠桌 500 件什么价？">询价</button>
+        <button data-sim="你们这个质量有问题，我要退货">售后</button>
+        <button data-sim="我要投诉你们，服务太差了">转人工</button>
+      </div>
+    </div>
+    <div class="key-row">
+      <label>模式</label>
+      <label style="font-size:12px;color:#475467"><input type="checkbox" id="simAuto" checked /> AI 自动回复（项目内展示）</label>
+    </div>
+    <div class="modal-actions">
+      <button id="simCancel">取消</button>
+      <button class="primary" id="simSubmit">发送模拟消息</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="setupModal">
+  <div class="modal-card">
+    <h2>首次启动检查</h2>
+    <div class="hint">全部通过后就可以开始接待；未通过项按提示点「去处理」。</div>
+    <div id="setupChecks"></div>
+    <div class="modal-actions">
+      <button id="setupRefresh">重新检查</button>
+      <button id="setupClose">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="settingsModal">
+  <div class="modal-card">
+    <h2>模型与 Key</h2>
+    <div class="hint">每个模型可填独立 API Key；留空表示沿用默认 ai.api_key。Key 只保存在本机 data/settings.json。</div>
+    <div id="keyRows"></div>
+    <div class="key-row" style="margin-top:14px">
+      <label>视觉模型（图片理解）</label>
+      <input id="visionModel" placeholder="如 qwen-vl-plus / doubao-seed-1.6-vision" />
+    </div>
+    <div class="key-row">
+      <label>Embedding 模型（向量 RAG）</label>
+      <input id="embeddingModel" placeholder="如 text-embedding-3-small / bge-m3" />
+    </div>
+    <div class="modal-actions">
+      <button id="settingsCancel">取消</button>
+      <button class="primary" id="settingsSave">保存并应用</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="calibrateModal">
+  <div class="modal-card">
+    <h2>校准布局</h2>
+    <div class="hint">拖动滑块让彩色区域贴合微信窗口，保存后立即生效（保存在 data/settings.json）。</div>
+    <div style="display:flex;gap:8px;margin-bottom:8px">
+      <button id="preset4">微信 4.x 预设</button>
+      <button id="preset3">微信 3.x 预设</button>
+      <button id="presetSaved">恢复已保存</button>
+    </div>
+    <div class="cal-wrap">
+      <img id="calImage" alt="窗口截图" />
+      <canvas id="calCanvas"></canvas>
+    </div>
+    <div class="cal-sliders">
+      <label>左侧图标栏 nav<input type="range" id="calNav" min="0" max="0.15" step="0.001" /><span id="calNavV"></span></label>
+      <label>会话列表宽度 list<input type="range" id="calList" min="0.15" max="0.6" step="0.001" /><span id="calListV"></span></label>
+      <label>标题栏高度 header<input type="range" id="calHeader" min="0.03" max="0.2" step="0.001" /><span id="calHeaderV"></span></label>
+      <label>输入区高度 input<input type="range" id="calInput" min="0.1" max="0.4" step="0.001" /><span id="calInputV"></span></label>
+    </div>
+    <div class="modal-actions">
+      <button id="calRefresh">重新抓图</button>
+      <button id="calCancel">取消</button>
+      <button class="primary" id="calSave">保存布局</button>
+    </div>
+  </div>
+</div>
+
+<footer id="footer"></footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = null;
+let selected = null;
+let draftKey = "";
+
+function chip(text, cls = "") { return `<span class="chip ${cls}">${text}</span>`; }
+
+function renderChips(s) {
+  const parts = [
+    chip(`平台 ${s.platform}`),
+    s.dry_run ? chip("dry-run 仅草稿", "warn") : chip("真实发送", "on"),
+  s.readonly ? chip("只读 · 不操作微信", "off") : "",
+
+    s.ocr ? chip("OCR 就绪", "on") : chip("OCR 未装", "warn"),
+    s.vision ? chip("视觉就绪", "on") : chip("视觉未配", "warn"),
+    chip(`工具 ${s.tools ? "开" : "关"}`),
+    s.group ? chip("群聊放行", "on") : chip("群聊关闭", ""),
+    chip(`人设 ${s.persona}`),
+    chip(`知识库 ${s.kb} 块`),
+    chip(`白名单 ${s.whitelist}`),
+  ];
+  $("chips").innerHTML = parts.join("");
+
+  const select = $("modelSelect");
+  const models = s.models && s.models.length ? s.models : [{ id: s.model, label: s.model, model: s.model }];
+  const signature = models.map((m) => m.id + ":" + m.model).join(",");
+  if (select.dataset.signature !== signature) {
+    select.innerHTML = models.map((m) =>
+      `<option value="${m.id}">${escapeHtml(m.label)}</option>`).join("");
+    select.dataset.signature = signature;
+  }
+  const current = models.find((m) => m.model === s.model) || models[0];
+  if (current && select.value !== current.id) select.value = current.id;
+  select.dataset.models = JSON.stringify(models);
+  const hint = $("modelKeyHint");
+  if (current && !current.has_key) { hint.style.display = ""; } else { hint.style.display = "none"; }
+  $("live").checked = !s.dry_run;
+  $("pause").textContent = s.paused ? "继续" : "暂停";
+  $("footer").innerHTML = [
+    `模型就绪：${s.llm_ready ? "是" : "否（未配置 api_key 时为模拟回复）"}`,
+    `模式：${s.dry_run ? "dry-run" : "真实发送"}`,
+    `人设：${s.persona}`,
+    `知识库：${s.kb} 块`,
+    `白名单：${s.whitelist} 人`,
+    `记忆：${s.memory || "data/memory.db"}`,
+    `工具：${s.tools ? "已启用（报价/库存）" : "关闭"}`,
+    `视觉：${s.vision ? "已配置" : "未配置"}`,
+  ].join("  ·  ");
+}
+
+let convSignature = "";
+function renderConversations(convs, current) {
+  const signature = JSON.stringify(convs.map((c) => [c.peer, c.status, c.unread, c.last_text, c.time, c.avatar])) + "|" + current;
+  if (signature === convSignature) return;
+  convSignature = signature;
+  if (!convs.length) {
+    $("conversations").innerHTML = `<div class="empty">暂无会话，等待未读</div>`;
+    return;
+  }
+  $("conversations").innerHTML = convs.map((c) => {
+    const initial = (c.peer || "?").slice(0, 1);
+    const unread = c.unread ? `<span class="badge">${c.unread}</span>` : "";
+    const active = c.peer === current ? "active" : "";
+    const inWhitelist = ((state.status.whitelist_names) || []).includes(c.peer);
+    const avatar = `<span class="letter">${escapeHtml(initial)}</span>` + (c.avatar
+      ? `<img src="${escapeAttr(c.avatar)}" alt="" onerror="this.style.display='none'" />`
+      : "");
+    return `<div class="conv ${active}" data-peer="${escapeAttr(c.peer)}">
+      <div class="avatar">${avatar}</div>
+      <div class="meta">
+        <div class="name"><span class="peer-name">${escapeHtml(c.peer)}</span>${c.simulated ? '<span class="badge" style="background:#722ed1">模拟</span>' : ""}${unread}<span class="conv-time">${escapeHtml(c.time || "")}</span></div>
+        <div class="status">${escapeHtml(c.status || "—")} · ${escapeHtml((c.last_text || "").slice(0, 18))}</div>
+      </div>
+      ${inWhitelist ? "" : `<button class="wl-quick" data-add="${escapeAttr(c.peer)}">+ 白名单</button>`}
+    </div>`;
+  }).join("");
+  document.querySelectorAll(".conv").forEach((el) => {
+    el.onclick = () => {
+      selected = el.dataset.peer;
+      act("select", { peer: selected });
+    };
+  });
+  if (convSyncScrollbar) setTimeout(convSyncScrollbar, 0);
+  document.querySelectorAll(".wl-quick").forEach((el) => {
+    el.onclick = (event) => {
+      event.stopPropagation();
+      const peer = el.dataset.add;
+      const current = (state && state.status.whitelist_names) || [];
+      if (peer && !current.includes(peer)) act("whitelist", { names: current.concat([peer]) });
+    };
+  });
+}
+
+let chatSignature = "";
+function renderChat() {
+  const title = selected || "";
+  const signature = title + "|" + JSON.stringify(state ? state.history : []);
+  if (signature === chatSignature) return;
+  chatSignature = signature;
+  $("peerTitle").textContent = title ? `与 ${title} 的会话` : "未选择会话";
+  const avatarImg = $("peerAvatar");
+  const currentConv = ((state && state.conversations) || []).find((item) => item.peer === title);
+  if (avatarImg) {
+    if (currentConv && currentConv.avatar) {
+      avatarImg.src = currentConv.avatar;
+      avatarImg.style.display = "";
+    } else {
+      avatarImg.style.display = "none";
+      avatarImg.removeAttribute("src");
+    }
+  }
+  if (!state || !selected) return;
+  const history = state.history || [];
+  if (!history.length) {
+    $("chat").innerHTML = `<div class="empty">等待新消息…</div>`;
+    return;
+  }
+  const kindLabel = { image: "图片", voice: "语音", file: "文件", system: "系统" };
+  const chatBox = $("chat");
+  chatBox.innerHTML = history.map((item) => {
+    const badge = kindLabel[item.kind] ? `<span class="tag">${kindLabel[item.kind]}</span>` : "";
+    if (item.dir === "in") {
+      return `<div class="row in"><div class="bubble"><span class="tag">对方</span>${badge}${escapeHtml(item.text)}</div></div>`;
+    }
+    if (item.dir === "out") {
+      return `<div class="row out"><div class="bubble"><span class="tag">我方</span>${badge}${escapeHtml(item.text)}</div></div>`;
+    }
+    if (item.dir === "sys") {
+      return `<div class="row"><div class="bubble" style="background:#f2f4f7;color:#8a94a6">${escapeHtml(item.text)}</div></div>`;
+    }
+    return `<div class="row draft"><div class="bubble"><span class="tag">草稿（待确认）</span>${escapeHtml(item.text)}</div></div>`;
+  }).join("");
+  requestAnimationFrame(() => { chatBox.scrollTop = chatBox.scrollHeight; });
+}
+
+function renderDraft() {
+  const pending = state && state.pending;
+  const mine = pending && pending.peer === selected;
+  const key = mine ? pending.peer + "|" + pending.reply : "";
+  if (mine && key !== draftKey) {
+    $("draft").value = pending.reply;
+    draftKey = key;
+    $("draftMeta").textContent = `${pending.model} · ${pending.latency_ms}ms`;
+  }
+  if (!mine) {
+    $("draftMeta").textContent = "";
+    if (draftKey) { draftKey = ""; }
+  }
+  ["send", "regen", "discard"].forEach((id) => { $(id).disabled = !mine; });
+}
+
+let eventSignature = "";
+function renderEvents(events) {
+  if (!events || !events.length) return;
+  const signature = JSON.stringify(events.slice(-40).map((e) => [e.seq, e.type, e.text]));
+  if (signature === eventSignature) return;
+  eventSignature = signature;
+  $("events").innerHTML = events.slice(-40).reverse().map((ev) => {
+    const ts = new Date((ev.ts || 0) * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+    return `<div class="event ${ev.type || ""}"><span class="ts">${ts}</span>${escapeHtml(ev.text || ev.type || "")}</div>`;
+  }).join("");
+}
+
+function escapeHtml(text) {
+  return String(text == null ? "" : text)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function escapeAttr(text) { return escapeHtml(text).replace(/`/g, "&#96;"); }
+
+async function fetchState() {
+  try {
+    const response = await fetch("/api/state", { cache: "no-store" });
+    state = await response.json();
+    if (!selected && state.selected) selected = state.selected;
+    if (selected && state.selected && !state.conversations.some((c) => c.peer === selected)) {
+      selected = state.selected;
+    }
+    renderChips(state.status);
+    renderWhitelist(state.status.whitelist_names);
+    renderConversations(state.conversations, selected);
+    renderChat();
+    renderDraft();
+    renderEvents(state.events);
+  } catch (error) {
+    $("footer").textContent = "控制台连接断开：" + error;
+  }
+  setTimeout(fetchState, 800);
+}
+
+async function act(action, payload = {}) {
+  try {
+    const response = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.assign({ action }, payload)),
+    });
+    const data = await response.json();
+    await fetch("/api/state");
+    return data;
+  } catch (error) {
+    console.error(error);
+    return { ok: false, error: "网络/服务异常：" + error };
+  }
+}
+
+
+// ---------- 白名单 ----------
+let whitelistSignature = "";
+function renderWhitelist(names) {
+  const signature = JSON.stringify(names || []);
+  if (signature === whitelistSignature) return;
+  whitelistSignature = signature;
+  const box = $("whitelist");
+  const list = names || [];
+  if (!list.length) {
+    box.innerHTML = `<span class="wl-chip" style="background:#f2f4f7;color:#8a94a6">暂无，添加后才会自动回复</span>`;
+    return;
+  }
+  box.innerHTML = list.map((name) =>
+    `<span class="wl-chip">${escapeHtml(name)}<b data-remove="${escapeAttr(name)}">×</b></span>`).join("");
+  box.querySelectorAll("b[data-remove]").forEach((el) => {
+    el.onclick = () => {
+      const next = list.filter((item) => item !== el.dataset.remove);
+      act("whitelist", { names: next });
+    };
+  });
+}
+
+function addWhitelist() {
+  const input = $("wlInput");
+  const name = (input.value || "").trim();
+  if (!name) return;
+  const current = (state && state.status.whitelist_names) || [];
+  if (!current.includes(name)) act("whitelist", { names: current.concat([name]) });
+  input.value = "";
+}
+
+// ---------- 设置（模型 Key） ----------
+function openSettings() {
+  const models = (state && state.status.models) || [];
+  $("keyRows").innerHTML = models.map((m) => `
+    <div class="key-row">
+      <label>${escapeHtml(m.label)}</label>
+      <input type="password" data-model="${escapeAttr(m.id)}" placeholder="${m.has_key ? "已配置，留空则不修改" : "未配置，请输入 API Key"}" />
+      <span class="state ${m.has_key ? "ok" : ""}">${m.has_key ? "已配置" : "缺 Key"}</span>
+    </div>`).join("");
+  $("visionModel").value = (state && state.status.vision_model) || "";
+  $("embeddingModel").value = (state && state.status.embedding_model) || "";
+  $("settingsModal").classList.add("open");
+}
+
+async function saveSettings() {
+  const keys = {};
+  document.querySelectorAll("#keyRows input[data-model]").forEach((input) => {
+    if ((input.value || "").trim()) keys[input.dataset.model] = input.value.trim();
+  });
+  if (Object.keys(keys).length) await act("api_keys", { keys });
+  await act("models", {
+    vision_model: $("visionModel").value.trim(),
+    embedding_model: $("embeddingModel").value.trim(),
+  });
+  $("settingsModal").classList.remove("open");
+}
+
+// ---------- 校准布局 ----------
+let calRatios = {};
+
+async function openCalibrate() {
+  $("calibrateModal").classList.add("open");
+  await refreshCalibrate();
+}
+
+async function refreshCalibrate() {
+  try {
+    const response = await fetch("/api/calibrate", { cache: "no-store" });
+    const data = await response.json();
+    if (!data.ok) { alert(data.error || "抓图失败"); return; }
+    calRatios = data.ratios || {};
+    $("calNav").value = calRatios.nav_ratio;
+    $("calList").value = calRatios.list_ratio;
+    $("calHeader").value = calRatios.header_ratio;
+    $("calInput").value = calRatios.input_ratio;
+    const image = $("calImage");
+    image.onload = () => { drawCal(); };
+    image.src = data.image;
+    if (image.complete) drawCal();
+  } catch (error) {
+    alert("校准失败：" + error);
+  }
+}
+
+function drawCal() {
+  const image = $("calImage");
+  const canvas = $("calCanvas");
+  if (!image.naturalWidth) return;
+  const displayWidth = image.clientWidth || image.naturalWidth;
+  const scale = displayWidth / image.naturalWidth;
+  const width = Math.round(image.naturalWidth * scale);
+  const height = Math.round(image.naturalHeight * scale);
+  canvas.width = width;
+  canvas.height = height;
+  canvas.style.width = width + "px";
+  canvas.style.height = height + "px";
+  const ratios = {
+    nav_ratio: parseFloat($("calNav").value),
+    list_ratio: parseFloat($("calList").value),
+    header_ratio: parseFloat($("calHeader").value),
+    input_ratio: parseFloat($("calInput").value),
+  };
+  $("calNavV").textContent = ratios.nav_ratio.toFixed(3);
+  $("calListV").textContent = ratios.list_ratio.toFixed(3);
+  $("calHeaderV").textContent = ratios.header_ratio.toFixed(3);
+  $("calInputV").textContent = ratios.input_ratio.toFixed(3);
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, width, height);
+  const v = (r) => Math.round(height * r);
+  const x = (r) => Math.round(width * r);
+  const rects = [
+    { box: [0, 0, x(ratios.nav_ratio), height], color: "#ff4d4f", label: "nav" },
+    { box: [x(ratios.nav_ratio), 0, x(ratios.list_ratio), height], color: "#fa8c16", label: "session_list" },
+    { box: [x(ratios.list_ratio), 0, width, v(ratios.header_ratio)], color: "#52c41a", label: "header" },
+    { box: [x(ratios.list_ratio), v(ratios.header_ratio), width, v(1 - ratios.input_ratio)], color: "#722ed1", label: "messages" },
+    { box: [x(ratios.list_ratio), v(1 - ratios.input_ratio), width, height], color: "#13c2c2", label: "input" },
+  ];
+  ctx.lineWidth = 2;
+  ctx.font = "12px -apple-system, PingFang SC";
+  rects.forEach((item) => {
+    const [x1, y1, x2, y2] = item.box;
+    ctx.strokeStyle = item.color;
+    ctx.strokeRect(x1 + 1, y1 + 1, Math.max(1, x2 - x1 - 2), Math.max(1, y2 - y1 - 2));
+    ctx.fillStyle = item.color;
+    ctx.fillText(item.label, x1 + 5, y1 + 16);
+  });
+}
+
+async function saveLayout() {
+  const ratios = {
+    nav_ratio: parseFloat($("calNav").value),
+    list_ratio: parseFloat($("calList").value),
+    header_ratio: parseFloat($("calHeader").value),
+    input_ratio: parseFloat($("calInput").value),
+  };
+  await act("layout", { ratios });
+  $("calibrateModal").classList.remove("open");
+}
+
+
+// ---------- 首次启动检查 ----------
+async function openSetup() {
+  try {
+    const response = await fetch("/api/setup", { cache: "no-store" });
+    const data = await response.json();
+    renderSetup(data);
+    $("setupModal").classList.add("open");
+  } catch (error) {
+    alert("检查失败：" + error);
+  }
+}
+
+function renderSetup(data) {
+  const box = $("setupChecks");
+  const banner = data.ready
+    ? `<div class="setup-item ok"><span class="setup-icon">✓</span><div class="setup-body"><div class="setup-label">全部就绪，可以开始接待</div><div class="setup-hint">建议先用 dry-run 看几条草稿，再允许真实发送。</div></div></div>`
+    : `<div class="setup-item bad"><span class="setup-icon">!</span><div class="setup-body"><div class="setup-label">还有未完成项</div><div class="setup-hint">按下面每项的提示处理，全部变绿即可。</div></div></div>`;
+  const items = (data.checks || []).map((c) => `
+    <div class="setup-item ${c.ok ? "ok" : "bad"}">
+      <span class="setup-icon">${c.ok ? "✓" : "!"}</span>
+      <div class="setup-body">
+        <div class="setup-label">${escapeHtml(c.label)}</div>
+        <div class="setup-hint">${escapeHtml(c.hint)}</div>
+      </div>
+      ${c.ok || !c.action ? "" : `<button data-setup-action="${c.action}">去处理</button>`}
+    </div>`).join("");
+  box.innerHTML = banner + items;
+  box.querySelectorAll("button[data-setup-action]").forEach((el) => {
+    el.onclick = () => {
+      const action = el.dataset.setupAction;
+      if (action === "settings") { $("setupModal").classList.remove("open"); openSettings(); }
+      else if (action === "calibrate") { $("setupModal").classList.remove("open"); openCalibrate(); }
+      else if (action === "whitelist") { $("setupModal").classList.remove("open"); $("wlInput").focus(); }
+      else if (action === "ocr") { alert("Windows 上双击 setup.bat 会自动安装 RapidOCR；\n或手动运行：pip install rapidocr_onnxruntime"); }
+    };
+  });
+}
+
+// ---------- 校准预设 ----------
+const LAYOUT_PRESETS = {
+  v4: { nav: 0.055, list: 0.34, header: 0.09, input: 0.22 },
+  v3: { nav: 0.0, list: 0.32, header: 0.10, input: 0.24 },
+};
+
+function applyPreset(preset) {
+  $("calNav").value = preset.nav;
+  $("calList").value = preset.list;
+  $("calHeader").value = preset.header;
+  $("calInput").value = preset.input;
+  drawCal();
+}
+
+
+// ---------- 会话列表：显式滚轮 + 自定义可拖拽滚动条 ----------
+let convSyncScrollbar = null;
+function setupConvScrollbar() {
+  const list = $("conversations");
+  const track = $("convScrollbar");
+  const thumb = $("convThumb");
+  if (!list || !track || !thumb) return;
+
+  const sync = () => {
+    const view = list.clientHeight;
+    const content = list.scrollHeight;
+    const trackH = track.clientHeight;
+    const ratio = content > view ? view / content : 1;
+    const thumbH = Math.max(32, Math.round(trackH * ratio));
+    const maxScroll = Math.max(1, content - view);
+    const top = content > view ? (list.scrollTop / maxScroll) * (trackH - thumbH) : 0;
+    thumb.style.height = thumbH + "px";
+    thumb.style.top = Math.max(0, Math.min(trackH - thumbH, top)) + "px";
+    track.style.visibility = content > view ? "visible" : "hidden";
+  };
+  convSyncScrollbar = sync;
+  list.addEventListener("scroll", sync, { passive: true });
+  window.addEventListener("resize", sync);
+
+  // 显式滚轮：不依赖浏览器原生滚动
+  list.addEventListener("wheel", (event) => {
+    const delta = event.deltaY || 0;
+    if (!delta) return;
+    list.scrollTop += delta;
+    event.preventDefault();
+    sync();
+  }, { passive: false });
+
+  // 拖拽滑块
+  let dragging = false;
+  let startY = 0;
+  let startTop = 0;
+  thumb.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    startY = event.clientY;
+    startTop = list.scrollTop;
+    thumb.classList.add("dragging");
+    thumb.setPointerCapture(event.pointerId);
+    event.preventDefault();
+  });
+  thumb.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    const trackH = track.clientHeight;
+    const thumbH = thumb.offsetHeight;
+    const maxThumb = Math.max(1, trackH - thumbH);
+    const maxScroll = Math.max(1, list.scrollHeight - list.clientHeight);
+    list.scrollTop = startTop + ((event.clientY - startY) / maxThumb) * maxScroll;
+    sync();
+  });
+  const stop = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    thumb.classList.remove("dragging");
+    try { thumb.releasePointerCapture(event.pointerId); } catch (_error) {}
+  };
+  thumb.addEventListener("pointerup", stop);
+  thumb.addEventListener("pointercancel", stop);
+
+  // 点轨道翻页
+  track.addEventListener("click", (event) => {
+    if (event.target === thumb) return;
+    const rect = track.getBoundingClientRect();
+    list.scrollTop += (event.clientY - rect.top < thumb.offsetTop ? -1 : 1) * list.clientHeight * 0.9;
+    sync();
+  });
+
+  sync();
+  setTimeout(sync, 100);
+}
+
+
+// ---------- 模拟客户来消息 ----------
+function openSimulate() {
+  const list = $("simPeerList");
+  const peers = ((state && state.conversations) || [])
+    .filter((c) => c.simulated || c.peer.startsWith("【模拟】"))
+    .map((c) => c.peer);
+  list.innerHTML = peers.map((p) => `<option value="${escapeAttr(p)}"></option>`).join("");
+  const input = $("simPeer");
+  if (!input.value) input.value = peers[0] || "模拟客户";
+  $("simulateModal").classList.add("open");
+}
+
+async function submitSimulate() {
+  const button = $("simSubmit");
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+  const peer = ($("simPeer").value || "").trim() || "测试客户";
+  const text = ($("simText").value || "").trim();
+  if (!text) { alert("请输入客户消息"); return; }
+  const result = await act("simulate", { peer, text, auto: $("simAuto").checked });
+  if (!result || !result.ok) {
+    alert("模拟失败：" + ((result && result.error) || "请查看右侧工作进度"));
+    return;
+  }
+  selected = peer;
+  $("simulateModal").classList.remove("open");
+  $("simText").value = "";
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("modelSelect").onchange = async (event) => {
+  const model = ((state && state.status.models) || []).find((m) => m.id === event.target.value);
+  await act("model", { id: event.target.value });
+  if (model && !model.has_key) openSettings();
+};
+$("wlAdd").onclick = addWhitelist;
+$("wlInput").addEventListener("keydown", (event) => { if (event.key === "Enter") addWhitelist(); });
+$("btnSync").onclick = () => act("sync");
+$("btnOffscreen").onclick = async () => {
+  const result = await act("offscreen");
+  if (!result || !result.ok) { alert("离屏切换失败：" + ((result && result.error) || "仅 Windows 支持")); return; }
+};
+
+$("btnSimulate").onclick = openSimulate;
+$("simCancel").onclick = () => $("simulateModal").classList.remove("open");
+$("simSubmit").onclick = submitSimulate;
+document.querySelectorAll("button[data-sim]").forEach((el) => {
+  el.onclick = () => { $("simText").value = el.dataset.sim; };
+});
+$("btnReadCurrent").onclick = async () => {
+  const result = await act("read_current");
+  if (!result || !result.ok) alert("读取失败：请先在微信里打开要读的聊天会话");
+};
+$("btnProcess").onclick = async () => {
+  const result = await act("process_current");
+  if (result && result.result) {
+    $("draft").value = result.result.reply || $("draft").value;
+  }
+};
+$("btnSetup").onclick = openSetup;
+$("setupClose").onclick = () => $("setupModal").classList.remove("open");
+$("setupRefresh").onclick = openSetup;
+$("preset4").onclick = () => applyPreset(LAYOUT_PRESETS.v4);
+$("preset3").onclick = () => applyPreset(LAYOUT_PRESETS.v3);
+$("presetSaved").onclick = () => {
+  const layout = (state && state.status.layout) || {};
+  applyPreset({
+    nav: layout.nav_ratio ?? 0.055, list: layout.list_ratio ?? 0.34,
+    header: layout.header_ratio ?? 0.09, input: layout.input_ratio ?? 0.22,
+  });
+};
+$("btnSettings").onclick = openSettings;
+$("settingsCancel").onclick = () => $("settingsModal").classList.remove("open");
+$("settingsSave").onclick = saveSettings;
+$("btnCalibrate").onclick = openCalibrate;
+$("calCancel").onclick = () => $("calibrateModal").classList.remove("open");
+$("calRefresh").onclick = refreshCalibrate;
+$("calSave").onclick = saveLayout;
+["calNav", "calList", "calHeader", "calInput"].forEach((id) => {
+  $(id).addEventListener("input", drawCal);
+});
+$("pause").onclick = () => act("pause", { paused: !(state && state.status.paused) });
+$("live").onchange = (event) => act("live", { live: event.target.checked });
+$("send").onclick = async () => {
+  const result = await act("approve", { text: $("draft").value, peer: selected });
+  const info = result && result.result;
+  if (!result || !result.ok) {
+    alert("发送失败：" + ((info && (info.detail || info.status)) || "没有可发送的草稿（请先在左栏选中对应会话）"));
+  } else if (info) {
+    alert("已发送（" + info.status + "）：" + (info.reply || "").slice(0, 40));
+  }
+};
+$("regen").onclick = () => act("regen");
+$("discard").onclick = () => act("discard");
+$("apply").onclick = () => act("instruction", { text: $("instruction").value });
+$("draft").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) act("approve", { text: $("draft").value });
+});
+
+setupConvScrollbar();
+fetchState();
+</script>
+</body>
+</html>

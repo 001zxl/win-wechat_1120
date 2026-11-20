@@ -1,0 +1,21 @@
+# 运行数据 / 密钥（严禁提交）
+config.yaml
+data/
+.env
+*.db
+*.sqlite
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# 调试截图 / 临时文件
+capture*.png
+*.tmp
+.pytest_cache/

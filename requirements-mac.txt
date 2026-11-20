@@ -1,0 +1,9 @@
+# macOS 真实微信后端依赖（Windows 用 requirements.txt）
+pyyaml>=6.0
+pillow>=9.0
+numpy>=1.21
+requests>=2.28
+pyobjc-framework-Cocoa==10.3.2
+pyobjc-framework-Quartz==10.3.2
+pyobjc-framework-ApplicationServices==10.3.2
+pyobjc-framework-Vision==10.3.2

@@ -1,0 +1,114 @@
+# 微信 AI 自动回复配置
+# 复制为 config.yaml 后填写（config.yaml 已在 .gitignore 里）
+
+ai:
+  base_url: "https://api.deepseek.com/v1"
+  api_key: "sk-REPLACE_ME"           # 你的模型 Key
+  model: "deepseek-chat"            # 默认模型（与 models 里某个 id 对应）
+  models:                           # 控制台可切换的模型列表
+    - { id: "deepseek", label: "DeepSeek V4", model: "deepseek-chat", base_url: "https://api.deepseek.com/v1" }
+    - { id: "qwen", label: "通义千问", model: "qwen-plus", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1" }
+    - { id: "kimi", label: "Kimi", model: "moonshot-v1-8k", base_url: "https://api.moonshot.cn/v1" }
+    - { id: "glm", label: "GLM-4", model: "glm-4-plus", base_url: "https://open.bigmodel.cn/api/paas/v4" }
+  vision_model: ""                  # 图片理解：如 doubao-1.5-vision-pro / qwen-vl-plus
+  vision_base_url: ""               # 留空复用 ai.base_url
+  embedding_model: ""               # 向量检索：如 text-embedding-3-small / bge-m3
+  temperature: 0.7
+  max_tokens: 300
+  timeout_s: 30
+
+runtime:
+  poll_interval_s: 1.0
+  settle_s: 0.35
+  aggregate_max_wait_s: 1.2
+  cooldown_s: 3
+  max_actions_per_min: 20
+  max_unread_per_cycle: 3
+  quiet_hours: []
+  dry_run: true
+  send_retries: 2                   # 发送失败/未确认时最多再试 2 次（先读回确认，避免重复）
+  offscreen: false                  # Windows：启动后把微信移入离屏空间（-3000,-3000），桌面零打扰
+  allow_group_chat: false           # 群聊自动回复开关
+  group_whitelist: []               # 群白名单（留空 = 允许所有群）
+  group_reply_mode: "mention"       # mention（只回@我）| keyword（命中关键词）| all
+  group_keywords: ["报价", "价格", "多少钱", "库存"]
+
+safety:
+  whitelist:
+    - "张三"
+    - "李四"
+  forbidden_keywords: ["转账", "私下交易", "红包"]
+  escalate_keywords: ["投诉", "退款", "退货", "律师", "起诉", "差评", "举报"]
+  max_reply_chars: 120
+  require_header_match: true
+  verify_send: true
+  forbidden_self_disclosure: ["作为AI", "作为 AI", "我是一个AI", "语言模型"]
+  # 拟人发送风控：会话冷却 + 小时/日上限 + 输入节奏抖动（降低自动化特征）
+  risk_enabled: true
+  risk_min_interval_s: 20
+  risk_max_per_hour: 10
+  risk_max_per_day: 50
+  typing_chars_per_second: 4.0
+  risk_jitter: 0.3
+  risk_max_wait_s: 15
+
+persona: "personas/sales_zhang.yaml"
+# 好友专属人设（奶龙思路）：按微信显示名覆盖默认语气；"默认" 作为兜底
+friend_personas:
+  张三: "死党互怼模式：幽默接地气，互开玩笑，绝不客套"
+  李四: "商务伙伴模式：礼貌、简洁、先给结论"
+  默认: ""
+kb_dir: "kb"
+
+memory:
+  db_path: "data/memory.db"
+  recent_limit: 8                   # 每次带最近 8 条进上下文
+  summarize_after: 12               # 每 12 条压缩一次摘要
+
+rag:
+  mode: "hybrid"                    # hybrid（向量+BM25，需 embedding_model）| bm25
+  top_k: 3
+  embedding_cache: "data/kb_embeddings.json"
+
+# ---------------- 全 IM 通道（借鉴宫崎兔/OmniDesk 的“一套助理接所有 IM”） ----------------
+# WeChat 走视觉/RPA；LINE/Telegram 等走各自 Bot API，共用同一套人设/知识库/记忆。
+channels:
+  - id: "wechat"
+    type: "wechat"
+    enabled: true
+  # - id: "line"
+  #   type: "line"
+  #   enabled: false
+  #   options:
+  #     endpoint: "https://api.line.me/v2/bot/message/push"
+  #     token: "LINE_CHANNEL_ACCESS_TOKEN"
+  #     provider: "line"
+  # - id: "telegram"
+  #   type: "telegram"
+  #   enabled: false
+  #   options:
+  #     endpoint: "https://api.telegram.org/bot<TOKEN>/sendMessage"
+  #     provider: "telegram"
+
+tools:
+  enabled: true
+  price_file: "data/price_list.json"
+  leads_file: "data/leads.jsonl"
+
+audit:
+  db_path: "data/audit.db"
+  evidence_dir: "data/evidence"
+  save_screenshots: true
+
+wechat:
+  title_keywords: ["微信", "Weixin", "WeChat"]
+  class_keywords: ["WeChatMainWndForPC", "Qt51514QWindowIcon", "Qt5", "WeChat"]
+  process_names: ["WeChat.exe", "Weixin.exe"]
+  mac_activate_on_click: true   # macOS：点击前先把微信切到前台（发送后还原）
+
+layout:
+  nav_ratio: 0.055
+  list_ratio: 0.34
+  header_ratio: 0.09
+  input_ratio: 0.22
+  overrides: {}
