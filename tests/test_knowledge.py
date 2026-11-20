@@ -150,6 +150,60 @@ class TestToolBudget(unittest.TestCase):
         self.assertEqual(result.tool_calls, 1)
 
 
+class TestOcrBackendSwitch(unittest.TestCase):
+    def test_paddle_backend_falls_back_to_rapidocr(self) -> None:
+        from wxreply.perception.ocr import OcrEngine
+
+        engine = OcrEngine(backend="paddle")
+        self.assertTrue(engine.available, "没装 PaddleOCR 时应自动退回 RapidOCR")
+        self.assertIn("PaddleOCR", engine.load_error or "")
+
+
+class TestWeKnoraAdapter(unittest.TestCase):
+    def test_parse_common_payloads(self) -> None:
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        hits = WeKnoraClient.parse_hits({"data": [
+            {"content": "FT-120 售价 2.9-3.3 美金", "source": "price.md", "score": 0.8},
+            "纯文本片段",
+        ]})
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits[0].source, "price.md")
+
+    def test_search_failure_returns_empty(self) -> None:
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        client = WeKnoraClient("http://127.0.0.1:9")
+        self.assertEqual(client.search("报价"), [])
+        self.assertTrue(client.last_error)
+
+
+class TestKnowledgeTriage(unittest.TestCase):
+    def test_price_question_without_evidence_goes_to_human(self) -> None:
+        from wxreply.agent import Agent
+        from wxreply.platform.mock import MockPlatform
+        from tests.test_reliability import make_config
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.kb_dir = os.path.join(tmp, "empty_kb")
+            os.makedirs(cfg.kb_dir, exist_ok=True)
+            cfg.tools.price_file = os.path.join(tmp, "missing_prices.json")
+            platform = MockPlatform()
+            platform.current = 0
+            platform.sessions[0].messages = [{"dir": "in", "kind": "text", "text": "这个多少钱？"}]
+            agent = Agent(cfg, platform, dry_run=True)
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            handled = agent._respond("张三", items, image, regions, False)
+            self.assertFalse(handled)
+            self.assertTrue(agent.handoff.is_taken("张三"),
+                            "没有可靠依据的价格问题必须转人工")
+            self.assertNotIn("张三", agent._pending)
+            agent.close()
+
+
 class TestExternalChannelsDisabled(unittest.TestCase):
     def test_line_channel_not_registered_by_default(self) -> None:
         configs = [

@@ -80,12 +80,47 @@ class VisionOcr:
         return lines
 
 
-class OcrEngine:
-    """文字轨：macOS 用 Vision，Windows 用 RapidOCR。"""
+class PaddleOcrBackend:
+    """PaddleOCR 可选后端：和 RapidOCR 做 A/B 对比时用（未安装则自动退回）。"""
 
-    def __init__(self, min_confidence: float = 0.5) -> None:
+    name = "paddleocr"
+
+    def __init__(self) -> None:
+        from paddleocr import PaddleOCR  # type: ignore
+
+        try:
+            self._engine = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
+        except TypeError:
+            self._engine = PaddleOCR(lang="ch")
+
+    def recognize(self, image: "Image.Image") -> List["OcrLine"]:
+        import numpy as np
+
+        array = np.array(image.convert("RGB"))[:, :, ::-1]
+        raw = self._engine.ocr(array)
+        lines: List[OcrLine] = []
+        for page in raw or []:
+            for item in page or []:
+                try:
+                    box, payload = item[0], item[1]
+                    text = str(payload[0])
+                    score = float(payload[1])
+                except Exception:
+                    continue
+                points = np.array(box).reshape(-1, 2)
+                lines.append(OcrLine(text, (float(points[:, 0].min()), float(points[:, 1].min()),
+                                            float(points[:, 0].max()), float(points[:, 1].max())),
+                                     score))
+        return lines
+
+
+class OcrEngine:
+    """文字轨：macOS 用 Vision；Windows 默认 RapidOCR，可切换到 PaddleOCR 做对比。"""
+
+    def __init__(self, min_confidence: float = 0.5, backend: str = "auto") -> None:
         self.min_confidence = min_confidence
-        self._backend = None  # "vision" | "rapidocr"
+        self.preferred = (backend or "auto").strip().lower()
+        self._backend = None  # "vision" | "rapidocr" | "paddleocr"
         self._engine = None
         self._vision = None
         self._load_error: Optional[str] = None
@@ -111,6 +146,13 @@ class OcrEngine:
                 return self._vision
             except Exception as exc:
                 self._load_error = f"Vision OCR 初始化失败: {exc}"
+        if self.preferred in ("paddle", "paddleocr"):
+            try:
+                self._engine = PaddleOcrBackend()
+                self._backend = "paddleocr"
+                return self._engine
+            except Exception as exc:
+                self._load_error = f"PaddleOCR 不可用，已退回 RapidOCR: {exc}"
         try:
             from rapidocr_onnxruntime import RapidOCR
 
@@ -132,6 +174,8 @@ class OcrEngine:
             raise RuntimeError(self._load_error or "OCR 不可用")
         if self._backend == "vision":
             return self._vision.recognize(image)
+        if self._backend == "paddleocr":
+            return self._engine.recognize(image)
         array = np.array(image.convert("RGB"))[:, :, ::-1]  # RGB -> BGR
         raw = self._engine(array)
         return self._normalize(raw)

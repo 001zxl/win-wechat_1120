@@ -155,6 +155,13 @@ Windows 一键安装：[setup.bat](setup.bat)（装依赖 + RapidOCR + doctor �
 9. **转人工是真接管**：命中投诉/退款等关键词后写入 `data/handoff.json`，该客户持续不自动回复，直到在控制台点「恢复自动回复」。
 10. **限频**：每会话冷却 + 全局滑动窗口，防触发平台风控。
 
+## 外部模块接入
+
+- 知识库可切换后端：`rag.provider: local | weknora`（WeKnora 未部署时自动回退本地 BM25）
+- OCR 可切换后端：`runtime.ocr_backend: auto | rapidocr | paddle`（未安装 Paddle 自动退回）
+- 价格/库存类问题无工具结果、无知识依据时直接转人工，不再让模型猜
+- 详细方案与分阶段计划见 [docs/接入方案.md](docs/接入方案.md)
+
 ## v0.5 正式自动发送前的整改
 
 **A 类（发错人 / 错发 / 授权失效）**

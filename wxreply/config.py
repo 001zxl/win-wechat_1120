@@ -93,6 +93,7 @@ class RuntimeConfig:
     send_retries: int = 2
     allow_real_actions: bool = False   # macOS 默认只读：不点击/不滚动/不发送
     offscreen: bool = False     # Windows: 启动后把微信移入离屏空间（-3000,-3000）
+    ocr_backend: str = "auto"   # auto | rapidocr | paddle
 
 
 @dataclass
@@ -133,6 +134,11 @@ class RagConfig:
     mode: str = "hybrid"          # bm25 | hybrid
     top_k: int = 3
     embedding_cache: str = "data/kb_embeddings.json"
+    provider: str = "local"       # local | weknora
+    weknora_base_url: str = ""    # 例如 http://192.168.1.10:8080
+    weknora_api_key: str = ""
+    weknora_search_path: str = "/api/v1/knowledge/search"
+    min_score: float = 0.2
 
 
 @dataclass

@@ -15,6 +15,7 @@ from .brain.llm import ModelRouter
 from .brain.memory import MemoryStore
 from .brain.persona import Persona, build_system_prompt, load_persona
 from .brain.rag import EmbeddingClient, KnowledgeBase
+from .brain.kb_weknora import WeKnoraClient, as_chunks as weknora_chunks
 from .brain.tools import ToolBox
 from .brain.vision import VisionClient
 from .config import Config
@@ -105,10 +106,15 @@ class Agent:
             config.resolve(config.rag.embedding_cache),
         )
         self.kb = KnowledgeBase(config.resolve(config.kb_dir), config.rag.mode, self.embeddings)
+        # 知识库后端：local（当前）或 weknora（远程服务，未部署时自动回退本地）
+        self.weknora = WeKnoraClient(
+            config.rag.weknora_base_url, config.rag.weknora_api_key,
+            config.rag.weknora_search_path,
+        ) if str(config.rag.provider).lower() == "weknora" else None
         self.router = ModelRouter(config.ai, dry_run=self.dry_run)
         self.router.client.dry_run = not self.router.client.ready
 
-        self.ocr = OcrEngine()
+        self.ocr = OcrEngine(backend=getattr(self.runtime, "ocr_backend", "auto"))
         self.whitelist = Whitelist(config.safety.whitelist, self.runtime.allow_group_chat)
         self.guardrails = Guardrails(
             config.safety.forbidden_keywords,
@@ -1728,14 +1734,28 @@ class Agent:
             return False
 
         reply, model, latency, tool_results = None, "", 0, []
+        tool_results = self.tools.prefetch(joined)
+        chunks = self._search_knowledge(joined)
+        # 价格/库存类问题：既没有工具结果、也没有知识依据时，转人工而不是让模型猜
+        if self._needs_evidence(joined) and not any(result.ok for result in tool_results) \
+                and not chunks:
+            self.handoff.take(peer, "没有可靠依据（产品/价格）")
+            self._touch(peer, status="转人工")
+            self.audit.record(peer=peer, action="escalate", status="no_evidence", incoming=joined)
+            self.emit("escalate", peer=peer, reason="没有可靠依据，转人工确认")
+            self._mark_event(peer, "done")
+            return False
         converged = False
         # 生成期间客户可能连续补充：最多重生成 2 次；超过仍不一致就挂起，绝不发旧答案
         for _round in range(3):
-            tool_results = self.tools.prefetch(joined)
+            if _round > 0:
+                tool_results = self.tools.prefetch(joined)
+                chunks = self._search_knowledge(joined)
             for result in tool_results:
                 self.emit("tool", name=result.name, summary=result.summary, ok=result.ok)
             reply, model, latency = self._generate(incoming, joined, history, profile,
-                                                   tool_results, is_group, peer=peer)
+                                                   tool_results, is_group, peer=peer,
+                                                   chunks=chunks)
             if reply is None:
                 self._touch(peer, status="生成失败待重试")
                 state = self._event_state.get(peer)
@@ -1847,6 +1867,22 @@ class Agent:
         except Exception:
             return None
 
+    def _search_knowledge(self, query: str) -> List[Any]:
+        """统一检索入口：WeKnora 优先，不可用/无命中时回退本地知识库。"""
+        client = getattr(self, "weknora", None)
+        if client is not None and client.enabled:
+            hits = client.search(query, top_k=self.config.rag.top_k)
+            if hits:
+                return weknora_chunks(hits)
+            if client.last_error:
+                self.emit("error", message=f"WeKnora 检索失败，已回退本地知识库：{client.last_error}")
+        return self.kb.search(query, top_k=self.config.rag.top_k)
+
+    @staticmethod
+    def _needs_evidence(text: str) -> bool:
+        return any(word in (text or "") for word in
+                   ("价", "多少钱", "报价", "价格", "库存", "有货", "现货", "型号", "美金", "usd"))
+
     # ---------- 生成 ----------
     def _friend_persona(self, peer: str) -> str:
         table = self.config.friend_personas or {}
@@ -1854,8 +1890,9 @@ class Agent:
 
     def _generate(self, incoming: List[str], joined: str, history: List[str],
                   profile: Dict[str, str], tool_results: List[Any], is_group: bool,
-                  peer: str = "") -> Tuple[Optional[str], str, int]:
-        chunks = self.kb.search(joined, top_k=self.config.rag.top_k)
+                  peer: str = "", chunks: Optional[List[Any]] = None) -> Tuple[Optional[str], str, int]:
+        if chunks is None:
+            chunks = self._search_knowledge(joined)
         system = build_system_prompt(self.persona, chunks, profile)
         if profile.get("summary"):
             system += f"\n【历史摘要】{profile['summary']}"
