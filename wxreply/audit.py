@@ -43,6 +43,20 @@ class AuditStore:
                 )
                 """
             )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    peer TEXT,
+                    signature TEXT,
+                    text TEXT,
+                    state TEXT,
+                    detail TEXT,
+                    evidence TEXT
+                )
+                """
+            )
             self._connection.commit()
 
     def record(
@@ -86,6 +100,32 @@ class AuditStore:
                 (time.time(), peer, action, incoming, reply, status, detail, model, latency_ms, evidence_path),
             )
             self._connection.commit()
+
+    def record_send(self, peer: str, signature: str, text: str, state: str,
+                    detail: str = "", evidence: str = "") -> None:
+        """发送台账：用于幂等（同一批消息不重复发）与「状态不明」人工核查。"""
+        with self._lock:
+            self._connection.execute(
+                "INSERT INTO sends (ts, peer, signature, text, state, detail, evidence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), peer, signature, text, state, detail, evidence),
+            )
+            self._connection.commit()
+
+    def find_send(self, peer: str, signature: str):
+        with self._lock:
+            return self._connection.execute(
+                "SELECT ts, peer, signature, text, state, detail FROM sends "
+                "WHERE peer = ? AND signature = ? ORDER BY id DESC LIMIT 1",
+                (peer, signature),
+            ).fetchone()
+
+    def recent_sends(self, limit: int = 20):
+        with self._lock:
+            return self._connection.execute(
+                "SELECT ts, peer, text, state, detail FROM sends ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
 
     def recent(self, limit: int = 20):
         with self._lock:

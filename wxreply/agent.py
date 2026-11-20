@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 import queue
 import threading
@@ -17,6 +18,7 @@ from .brain.tools import ToolBox
 from .brain.vision import VisionClient
 from .config import Config
 from .executor.sender import SafeSender
+from .handoff import HandoffStore
 from .perception.chat import lines_from_ocr, settle_capture
 from .perception.layout import LayoutCalculator, Regions
 from .perception.dual import PixelSentinel, downscale_for_ocr, lines_from_ocr_colored
@@ -31,8 +33,18 @@ from .policy import (
     group_allows,
     in_quiet_hours,
     is_group_name,
+    is_same_peer_strict,
     normalize_name,
 )
+
+
+def _wx_locked(method):
+    """所有微信操作串行执行：自动扫描、控制台点击、人工发送共用一把锁。"""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.wx_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 _SYSTEM_PATTERNS = (
@@ -98,7 +110,9 @@ class Agent:
             config.safety.max_reply_chars,
         )
         self.limiter = RateLimiter(self.runtime.max_actions_per_min, self.runtime.cooldown_s)
-        self.sender = SafeSender(platform, config, self.whitelist, self.ocr)
+        # 所有微信操作（扫描/点击/发送）共用同一把锁，避免自动线程与人手操作互相打断
+        self.wx_lock = threading.RLock()
+        self.sender = SafeSender(platform, config, self.whitelist, self.ocr, lock=self.wx_lock)
         saved_layout = False
         settings_path = config.resolve(config.settings_path)
         if os.path.exists(settings_path):
@@ -130,6 +144,8 @@ class Agent:
         os.makedirs(self.media_dir, exist_ok=True)
         self.avatar_dir = config.resolve("data/avatars")
         os.makedirs(self.avatar_dir, exist_ok=True)
+        # 人工接管（持久化）：接管期间该会话不再自动回复，直到显式恢复
+        self.handoff = HandoffStore(config.resolve(config.handoff_path))
 
         # ---- 运行状态 ----
         self.events: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=1000)
@@ -155,6 +171,11 @@ class Agent:
     # ---------- 运行控制 ----------
     def set_dry_run(self, value: bool) -> None:
         self.dry_run = bool(value)
+        # 配置里的 runtime.dry_run 也要同步，否则发送限频等按配置判断的分支会被跳过
+        try:
+            self.runtime.dry_run = self.dry_run
+        except Exception:
+            pass
         self.router.set_dry_run(not self.router.client.ready)
         self.emit("status", message=f"真实发送={'开' if not self.dry_run else '关（仅草稿）'}")
 
@@ -296,6 +317,7 @@ class Agent:
             self.platform.close()
 
     # ---------- 单轮 ----------
+    @_wx_locked
     def cycle(self) -> int:
         if getattr(self.platform, "passive", False):
             if not getattr(self, "_passive_notice", False):
@@ -581,6 +603,7 @@ class Agent:
         return {"peer": peer, "incoming": text, "reply": reply, "auto": auto,
                 "model": model, "latency_ms": latency}
 
+    @_wx_locked
     def read_current(self) -> Optional[str]:
         """读取微信当前已经打开的会话（最可靠，不尝试切换会话）。"""
         image = self.platform.capture()
@@ -594,6 +617,7 @@ class Agent:
             return peer
         return None
 
+    @_wx_locked
     def read_conversation(self, peer: str, open_first: bool = True) -> bool:
         """读取聊天历史；open_first=False 表示只读当前打开会话。"""
         if open_first and not self.open_conversation(peer):
@@ -1007,6 +1031,7 @@ class Agent:
         # 不再对每个红点单独跑一次 OCR 数字（一次约 1 秒，是同步慢的主因），有红点即算未读
         return 1
 
+    @_wx_locked
     def sync_conversations(self, deep: bool = False) -> int:
         snapshot = getattr(self.platform, "session_snapshot", None)
         if callable(snapshot):
@@ -1330,8 +1355,52 @@ class Agent:
         self._list_cached_at = time.time()
         return len(parsed)
 
+    # ---------- 发送闸门（所有发送入口共用） ----------
+    def send_gate(self, peer: str, manual: bool = False) -> Tuple[bool, str]:
+        if self.dry_run:
+            return False, "dry_run"
+        if not self.router.client.ready:
+            return False, "model_not_ready"
+        if not manual and self.handoff.is_taken(peer):
+            return False, "manual_takeover"
+        allowed, _matched = self.whitelist.matches(peer)
+        if not allowed:
+            return False, "not_whitelisted"
+        if not self.limiter.allowed(peer):
+            return False, "rate_limited"
+        return True, ""
+
+    def _already_sent(self, peer: str, signature: str) -> Optional[str]:
+        """同一批客户消息是否已经发过（含状态不明的），防止重复回复。"""
+        if not signature:
+            return None
+        try:
+            row = self.audit.find_send(peer, signature)
+        except Exception:
+            return None
+        if row is None:
+            return None
+        state = row[4]
+        return state if state in ("verified", "uncertain") else None
+
+    def takeover(self, peer: str, reason: str = "人工接管") -> None:
+        self.handoff.take(peer, reason)
+        self._touch(peer, status="人工接管")
+        self.emit("handoff", peer=peer, reason=reason)
+
+    def release_handoff(self, peer: str) -> bool:
+        released = self.handoff.release(peer)
+        if released:
+            self._touch(peer, status="已恢复自动")
+            self.emit("handoff", peer=peer, reason="已恢复自动回复")
+        return released
+
     # ---------- 处理一个未读 ----------
     def _handle_unread(self, badge, regions: Regions) -> bool:
+        with self.wx_lock:
+            return self._handle_unread_locked(badge, regions)
+
+    def _handle_unread_locked(self, badge, regions: Regions) -> bool:
         if hasattr(self.platform, "ensure_visible"):
             try:
                 self.platform.ensure_visible()
@@ -1378,12 +1447,27 @@ class Agent:
                 self.emit("skip", peer=peer, reason="不在白名单")
                 return False
 
+        # 人工接管中：只记录消息，不回复
+        if self.handoff.is_taken(peer):
+            for item in items:
+                self.memory.add(peer, "in", item.kind, item.prompt_text())
+            self._touch(peer, status="人工接管", unread=0)
+            self.audit.record(peer=peer, action="skip", status="manual_takeover",
+                              incoming=" / ".join(item.prompt_text() for item in items))
+            self.emit("skip", peer=peer, reason="人工接管中，不自动回复")
+            return False
+
+        return self._respond(peer, items, image, regions, is_group)
+
+    # ---------- 生成并（在允许时）发送 ----------
+    def _respond(self, peer: str, items, image, regions: Regions, is_group: bool) -> bool:
         self._touch(peer, status="处理中", unread=0)
         incoming = [item.prompt_text() for item in items]
         joined = " / ".join(incoming)
 
         history = self.memory.history_lines(peer, self.config.memory.recent_limit)
         profile = self.memory.profile(peer)
+        # 客户消息照常进入记忆（这是事实），但"我方"只有确认发出才写
         for item in items:
             self.memory.add(peer, "in", item.kind, item.prompt_text())
         self.emit("incoming", peer=peer, messages=incoming, kinds=[item.kind for item in items])
@@ -1392,19 +1476,19 @@ class Agent:
         if self._replied.get(peer) == signature:
             self.emit("skip", peer=peer, reason="重复消息")
             return False
+        already = self._already_sent(peer, signature)
+        if already:
+            self._replied[peer] = signature
+            self.emit("skip", peer=peer, reason=f"这批消息已发送过（{already}），不重复发送")
+            return False
 
         decision = self.guardrails.assess_incoming(joined)
         if decision.action == "escalate":
+            self.handoff.take(peer, decision.reason)
             self._touch(peer, status="转人工")
             self.audit.record(peer=peer, action="escalate", status="handoff",
                               incoming=joined, detail=decision.reason)
             self.emit("escalate", peer=peer, reason=decision.reason)
-            return False
-
-        if not self.limiter.allowed(peer):
-            wait = self.limiter.wait_seconds(peer)
-            self.emit("rate_limited", peer=peer, wait=round(wait, 1))
-            time.sleep(min(wait, 3.0))
             return False
 
         tool_results = self.tools.prefetch(joined)
@@ -1416,6 +1500,33 @@ class Agent:
         if reply is None:
             return False
 
+        # 模型生成期间客户可能又补了一句（"刚才说错了，要三个"）：以最新内容为准重新生成一次
+        latest = self._latest_incoming(peer)
+        if latest:
+            latest_joined = " / ".join(item.prompt_text() for item in latest)
+            if normalize_name(latest_joined) != signature:
+                items = latest
+                incoming = [item.prompt_text() for item in items]
+                joined = latest_joined
+                signature = normalize_name(joined)
+                for item in items:
+                    self.memory.add(peer, "in", item.kind, item.prompt_text())
+                self.emit("incoming", peer=peer, messages=incoming,
+                          kinds=[item.kind for item in items])
+                decision = self.guardrails.assess_incoming(joined)
+                if decision.action == "escalate":
+                    self.handoff.take(peer, decision.reason)
+                    self._touch(peer, status="转人工")
+                    self.audit.record(peer=peer, action="escalate", status="handoff",
+                                      incoming=joined, detail=decision.reason)
+                    self.emit("escalate", peer=peer, reason=decision.reason)
+                    return False
+                tool_results = self.tools.prefetch(joined)
+                reply, model, latency = self._generate(incoming, joined, history, profile,
+                                                       tool_results, is_group, peer=peer)
+                if reply is None:
+                    return False
+
         self._pending[peer] = {
             "peer": peer, "reply": reply, "incoming": joined, "image": image,
             "regions": regions, "model": model, "latency_ms": latency,
@@ -1426,22 +1537,41 @@ class Agent:
             self._pending_order.remove(peer)
         self._pending_order.append(peer)
         self._touch(peer, status="草稿待发", unread=0, text=reply)
-        audit_status = "dry_run" if self.dry_run else "draft"
-        self.audit.record(peer=peer, action="draft", status=audit_status,
+        self.audit.record(peer=peer, action="draft",
+                          status="dry_run" if self.dry_run else "draft",
                           incoming=joined, reply=reply, model=model,
                           latency_ms=latency, image=image)
         self.emit("draft", peer=peer, reply=reply, model=model,
                   latency_ms=latency, dry_run=self.dry_run,
                   tools=[result.name for result in tool_results])
 
-        if self.dry_run:
-            self.memory.add(peer, "out", "text", reply)
-            self._replied[peer] = signature
-            self.limiter.record(peer, cost=1)
-            self._maybe_summarize(peer)
+        ok, reason = self.send_gate(peer)
+        if not ok:
+            # 草稿保留在待发队列，绝不因为"看起来该发"就发出去
+            self.audit.record(peer=peer, action="draft", status=f"held_{reason}",
+                              incoming=joined, reply=reply, model=model, latency_ms=latency)
+            self.emit("held", peer=peer, reason=reason, reply=reply)
+            return True
+
+        # 生成期间可能有人点了"转人工"，发送前再确认一次
+        if self.handoff.is_taken(peer):
+            self.emit("held", peer=peer, reason="manual_takeover", reply=reply)
             return True
         outcome = self.sender.send(peer, reply, image, regions)
         return self._finish_send(peer, reply, outcome, joined, model, latency, signature)
+
+    def _latest_incoming(self, peer: str):
+        """生成期间复核：当前会话是否还是同一个客户、有没有新消息。"""
+        try:
+            image = self.platform.capture()
+            if image is None:
+                return None
+            regions = self.layout.regions(image.width, image.height)
+            if not is_same_peer_strict(self.sender.read_header(image, regions), peer):
+                return None
+            return self._read_items(image, regions)
+        except Exception:
+            return None
 
     # ---------- 生成 ----------
     def _friend_persona(self, peer: str) -> str:
@@ -1516,10 +1646,16 @@ class Agent:
     # ---------- 发送结果 ----------
     def _finish_send(self, peer: str, reply: str, outcome, joined: str,
                      model: str, latency: int, signature: str) -> bool:
-        self.audit.record(peer=peer, action="send", status=outcome.outcome.status,
-                          incoming=joined, reply=reply, detail=outcome.outcome.detail,
+        status = outcome.outcome.status
+        detail = outcome.outcome.detail
+        self.audit.record(peer=peer, action="send", status=status,
+                          incoming=joined, reply=reply, detail=detail,
                           model=model, latency_ms=latency)
-        if outcome.outcome.status == "verified":
+        try:
+            self.audit.record_send(peer, signature, reply, status, detail)
+        except Exception:
+            pass
+        if status == "verified":
             self.memory.add(peer, "out", "text", reply)
             self._touch(peer, status="已发送", unread=0, text=reply)
             self._replied[peer] = signature
@@ -1527,13 +1663,17 @@ class Agent:
             self._pending.pop(peer, None)
             if peer in self._pending_order:
                 self._pending_order.remove(peer)
-            self.emit("sent", peer=peer, status="verified", reply=reply,
-                      detail=outcome.outcome.detail)
+            self.emit("sent", peer=peer, status="verified", reply=reply, detail=detail)
             self._maybe_summarize(peer)
             return True
-        self._touch(peer, status="发送未确认")
-        self.emit("sent", peer=peer, status=outcome.outcome.status, reply=reply,
-                  detail=outcome.outcome.detail)
+        if status == "uncertain":
+            # 已经按过回车但没能确认：不再自动重发，转人工核查，避免重复轰炸客户
+            self.handoff.take(peer, "发送状态不明，需人工核查")
+            self._touch(peer, status="发送待人工确认")
+            self.emit("handoff", peer=peer, reason="发送状态不明，已暂停自动回复")
+        else:
+            self._touch(peer, status=f"未发送（{detail}）")
+        self.emit("sent", peer=peer, status=status, reply=reply, detail=detail)
         return False
 
     # ---------- 摘要（长记忆压缩） ----------
@@ -1696,6 +1836,7 @@ class Agent:
         y = (target.bbox[1] + target.bbox[3]) / 2.0
         return self._click_peer_row(regions, y, peer)
 
+    @_wx_locked
     def open_conversation(self, peer: str) -> bool:
         """打开任意会话：可见列表 → 滚动查找 → 搜索兜底。"""
         if self._open_by_visible(peer):
@@ -1824,8 +1965,12 @@ class Agent:
         check_regions = self.layout.regions(current.width, current.height)
         return normalize_name(self.sender.read_header(current, check_regions)) == wanted
 
-    # ---------- 手动：处理当前打开的会话（不点不点，只读+生成草稿） ----------
+    # ---------- 手动：处理当前打开的会话 ----------
     def process_current(self) -> Optional[Dict[str, Any]]:
+        with self.wx_lock:
+            return self._process_current_locked()
+
+    def _process_current_locked(self) -> Optional[Dict[str, Any]]:
         image = self.platform.capture()
         if image is None:
             self.emit("error", message="抓图失败")
@@ -1858,51 +2003,18 @@ class Agent:
             if not allowed:
                 self.emit("skip", peer=peer, reason="不在白名单（当前会话）")
                 return None
-        incoming = [item.prompt_text() for item in items]
-        joined = " / ".join(incoming)
-        signature_now = normalize_name(joined)
-        if self._replied.get(peer) == signature_now:
-            self.emit("skip", peer=peer, reason="当前会话消息已处理过")
+        if self.handoff.is_taken(peer):
+            self.emit("skip", peer=peer, reason="人工接管中，不自动回复")
             return None
-        history = self.memory.history_lines(peer, self.config.memory.recent_limit)
-        profile = self.memory.profile(peer)
-        for item in items:
-            self.memory.add(peer, "in", item.kind, item.prompt_text())
-        self.emit("incoming", peer=peer, messages=incoming,
-                  kinds=[item.kind for item in items])
-        signature = normalize_name(joined)
-        decision = self.guardrails.assess_incoming(joined)
-        if decision.action == "escalate":
-            self.emit("escalate", peer=peer, reason=decision.reason)
+        # 与未读路径走同一套「生成 → 闸门 → 发送」，不再出现"这里永远只出草稿"
+        handled = self._respond(peer, items, image, regions, is_group_name(peer))
+        if not handled:
             return None
-        tool_results = self.tools.prefetch(joined)
-        for result in tool_results:
-            self.emit("tool", name=result.name, summary=result.summary, ok=result.ok)
-        reply, model, latency = self._generate(incoming, joined, history, profile,
-                                               tool_results, is_group_name(peer), peer=peer)
-        if reply is None:
-            return None
-        self._pending[peer] = {
-            "peer": peer, "reply": reply, "incoming": joined, "image": image,
-            "regions": regions, "model": model, "latency_ms": latency,
-            "incoming_items": incoming, "history": history, "profile": profile,
-            "tool_results": [result.as_dict() for result in tool_results],
-            "is_group": is_group_name(peer),
-        }
-        if peer in self._pending_order:
-            self._pending_order.remove(peer)
-        self._pending_order.append(peer)
-        self._touch(peer, status="草稿待发", unread=0, text=reply)
-        self.audit.record(peer=peer, action="draft", status="manual_draft",
-                          incoming=joined, reply=reply, model=model,
-                          latency_ms=latency, image=image)
-        self.emit("draft", peer=peer, reply=reply, model=model,
-                  latency_ms=latency, dry_run=self.dry_run,
-                  tools=[result.name for result in tool_results])
-        if self.dry_run:
-            self.memory.add(peer, "out", "text", reply)
-        return {"peer": peer, "reply": reply, "dry_run": self.dry_run,
-                "incoming": incoming}
+        draft = self._pending.get(peer)
+        if draft is None:
+            return {"peer": peer, "reply": "", "sent": True, "incoming": []}
+        return {"peer": peer, "reply": draft.get("reply", ""), "dry_run": self.dry_run,
+                "incoming": [item.prompt_text() for item in items]}
 
     # ---------- 人工介入 ----------
     def _resolve_pending(self, peer: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -1912,6 +2024,11 @@ class Agent:
 
     def approve_pending(self, text_override: Optional[str] = None,
                         peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self.wx_lock:
+            return self._approve_pending_locked(text_override, peer)
+
+    def _approve_pending_locked(self, text_override: Optional[str] = None,
+                                peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
         pending = self._resolve_pending(peer)
         if not pending:
             return None
@@ -1922,11 +2039,28 @@ class Agent:
             return {"ok": False, "status": "blocked", "detail": checked.reason,
                     "peer": peer, "reply": reply}
         pending["reply"] = checked.text
-        # 如果用户已经切到别的会话，先切回目标会话再发，否则会被 header 校验中止
+
+        # 统一闸门：人工批准也必须过 live / 模型就绪 / 白名单 / 限频（接管状态由人工覆盖）
+        ok, reason = self.send_gate(peer, manual=True)
+        if not ok:
+            self.audit.record(peer=peer, action="send", status=f"blocked_{reason}",
+                              reply=pending["reply"])
+            return {"ok": False, "status": "blocked", "detail": reason,
+                    "peer": peer, "reply": pending["reply"]}
+
+        signature = normalize_name(pending.get("incoming", ""))
+        already = self._already_sent(peer, signature)
+        if already == "verified":
+            return {"ok": False, "status": "duplicate",
+                    "detail": "这批消息已确认发送过，拒绝重复发送",
+                    "peer": peer, "reply": pending["reply"]}
+
+        # 如果用户已经切到别的会话，先切回目标会话再发
         current = self.platform.capture()
         if current is not None:
             regions = self.layout.regions(current.width, current.height)
-            if normalize_name(self.sender.read_header(current, regions)) != normalize_name(peer):
+            header_now = self.sender.read_header(current, regions)
+            if not is_same_peer_strict(header_now, peer):
                 if not self.open_conversation(peer):
                     return {"ok": False, "status": "aborted",
                             "detail": "无法切回目标会话", "peer": peer,
@@ -1938,7 +2072,6 @@ class Agent:
         if pending["image"] is None:
             pending["image"] = self.platform.capture()
         outcome = self.sender.send(peer, pending["reply"], pending["image"], pending["regions"])
-        signature = normalize_name(pending.get("incoming", ""))
         ok = self._finish_send(peer, pending["reply"], outcome, pending.get("incoming", ""),
                                pending.get("model", ""), pending.get("latency_ms", 0), signature)
         return {"ok": ok, "status": outcome.outcome.status, "detail": outcome.outcome.detail,
@@ -1973,19 +2106,23 @@ class Agent:
         return {"reply": reply, "peer": pending["peer"]}
 
     def send_manual(self, peer: str, text: str) -> Optional[Dict[str, Any]]:
-        image = self.platform.capture()
-        if image is None:
-            return {"ok": False, "status": "capture_failed"}
-        regions = self.layout.regions(image.width, image.height)
-        checked = self.guardrails.check_reply(text)
-        if checked.action != "reply":
-            return {"ok": False, "status": "blocked", "detail": checked.reason}
-        outcome = self.sender.send(peer, checked.text, image, regions)
-        if outcome.outcome.status == "verified":
-            self.memory.add(peer, "out", "text", checked.text)
-            self._touch(peer, status="已发送", text=checked.text)
-        return {"ok": outcome.outcome.status == "verified",
-                "status": outcome.outcome.status, "detail": outcome.outcome.detail}
+        with self.wx_lock:
+            image = self.platform.capture()
+            if image is None:
+                return {"ok": False, "status": "capture_failed"}
+            regions = self.layout.regions(image.width, image.height)
+            checked = self.guardrails.check_reply(text)
+            if checked.action != "reply":
+                return {"ok": False, "status": "blocked", "detail": checked.reason}
+            ok, reason = self.send_gate(peer, manual=True)
+            if not ok:
+                return {"ok": False, "status": "blocked", "detail": reason}
+            outcome = self.sender.send(peer, checked.text, image, regions)
+            if outcome.outcome.status == "verified":
+                self.memory.add(peer, "out", "text", checked.text)
+                self._touch(peer, status="已发送", text=checked.text)
+            return {"ok": outcome.outcome.status == "verified",
+                    "status": outcome.outcome.status, "detail": outcome.outcome.detail}
 
     def close(self) -> None:
         self.audit.close()

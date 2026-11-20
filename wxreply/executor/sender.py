@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import difflib
 import re
+import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from ..config import Config
 from ..perception.chat import changed_ratio, has_new_outgoing
 from ..perception.layout import Regions
 from ..platform.base import Platform, SendOutcome
-from ..policy import Whitelist, normalize_name
+from ..policy import Whitelist, is_same_peer_strict, normalize_name
 from .risk import SendRiskController
 
 ABORT_HEADER_MISMATCH = "header_mismatch"
+ABORT_HEADER_CHANGED = "header_changed"
+ABORT_WINDOW_RESIZED = "window_resized"
+ABORT_CAPTURE = "capture_before_paste_failed"
 ABORT_NOT_WHITELIST = "not_whitelisted"
 ABORT_FOCUS = "focus_failed"
 
@@ -32,12 +36,15 @@ class SendResult:
 class SafeSender:
     """发送安全链：白名单 → header 校验 → 前台校验 → 粘贴/回车 → 还焦点 → 差分验收。"""
 
-    def __init__(self, platform: Platform, config: Config, whitelist: Whitelist, ocr=None) -> None:
+    def __init__(self, platform: Platform, config: Config, whitelist: Whitelist, ocr=None,
+                 lock: Optional[threading.RLock] = None) -> None:
         self.platform = platform
         self.config = config
         self.whitelist = whitelist
         self.ocr = ocr
         self.risk = SendRiskController(config.safety)
+        # 所有微信操作共用同一把锁：自动扫描 / 控制台点击 / 人工操作串行执行
+        self.lock = lock or threading.RLock()
 
     # ---------- 读取当前会话标题 ----------
     def read_header(self, image, regions: Regions) -> str:
@@ -82,16 +89,23 @@ class SafeSender:
 
     # ---------- 发送主流程 ----------
     def send(self, peer: str, text: str, pre_image, regions: Regions) -> SendResult:
+        # 串行化：自动扫描 / 控制台点击 / 人工操作共用同一把锁
+        with self.lock:
+            return self._send_locked(peer, text, pre_image, regions)
+
+    def _send_locked(self, peer: str, text: str, pre_image, regions: Regions) -> SendResult:
         runtime = self.config.runtime
+        safety = self.config.safety
         if getattr(self.platform, "passive", False):
             return SendResult(SendOutcome("aborted", "readonly_passive_macos"))
-        safety = self.config.safety
         allowed, _matched = self.whitelist.matches(peer)
         if not allowed:
             return SendResult(SendOutcome("aborted", ABORT_NOT_WHITELIST))
+        if pre_image is None:
+            return SendResult(SendOutcome("aborted", ABORT_CAPTURE))
 
         header = self.read_header(pre_image, regions)
-        if safety.require_header_match and normalize_name(header) != normalize_name(peer):
+        if safety.require_header_match and not is_same_peer_strict(header, peer):
             return SendResult(SendOutcome("aborted", ABORT_HEADER_MISMATCH), header=header)
 
         window = self.platform.find_window()
@@ -122,7 +136,7 @@ class SafeSender:
 
         attempts = max(1, int(runtime.send_retries) + 1)
         last = SendResult(SendOutcome("uncertain", "no_attempt"), header=header)
-        for attempt in range(attempts):
+        for _attempt in range(attempts):
             original_foreground = self.platform.get_foreground()
             if not self.platform.focus(window):
                 if hasattr(self.platform, "ensure_visible") and self.platform.ensure_visible():
@@ -132,6 +146,22 @@ class SafeSender:
             if safety.require_header_match and self.platform.get_foreground() != window.hwnd:
                 self.platform.restore_foreground(original_foreground)
                 return SendResult(SendOutcome("aborted", ABORT_FOCUS), header=header)
+
+            # 关键闸门：抢到前台后重新截图核对「当前联系人还是不是目标」。
+            # 校验通过到真正粘贴之间可能被人手动切走，所以这一步必须在粘贴前做。
+            check = self.platform.capture()
+            if check is None:
+                self.platform.restore_foreground(original_foreground)
+                last = SendResult(SendOutcome("failed", ABORT_CAPTURE), header=header)
+                continue                      # 没发出去，可安全重试
+            if (check.width, check.height) != (pre_image.width, pre_image.height):
+                self.platform.restore_foreground(original_foreground)
+                return SendResult(SendOutcome("aborted", ABORT_WINDOW_RESIZED), header=header)
+            header_now = self.read_header(check, regions)
+            if safety.require_header_match and not is_same_peer_strict(header_now, peer):
+                self.platform.restore_foreground(original_foreground)
+                return SendResult(SendOutcome("aborted", ABORT_HEADER_CHANGED), header=header_now)
+
             try:
                 input_x = regions.input[0] + max(40, (regions.input[2] - regions.input[0]) * 0.2)
                 input_y = regions.input[1] + max(24, min(48, (regions.input[3] - regions.input[1]) * 0.3))
@@ -139,7 +169,7 @@ class SafeSender:
                 time.sleep(0.05)
                 if not self.platform.set_clipboard(text):
                     last = SendResult(SendOutcome("failed", "clipboard_failed"), header=header)
-                    break
+                    continue                  # 剪贴板失败：确定没发出去，可重试
                 self.platform.press_ctrl_v()
                 time.sleep(0.08)
                 self.platform.press_enter()
@@ -155,23 +185,62 @@ class SafeSender:
             if not safety.verify_send:
                 return SendResult(SendOutcome("unverified", "verify_disabled"), header=header)
 
-            time.sleep(runtime.settle_s)
+            time.sleep(max(0.25, runtime.settle_s))
             post_image = self.platform.capture()
             if post_image is None:
+                # 已经按了回车，但看不到结果：不能重发，交人工核查
                 last = SendResult(SendOutcome("uncertain", "capture_after_send_failed"), header=header)
-                continue
+                break
+
             changed = changed_ratio(pre_image, post_image, regions)
-            if has_new_outgoing(post_image, regions) and changed >= 0.002:
+            structured = self.platform.last_outgoing_text()
+            if structured is not None and self._similar(structured, text):
+                self.risk.record(peer)
+                return SendResult(SendOutcome("verified", "bubble_confirmed"), header=header, changed=changed)
+            if self._verify_new_bubble(pre_image, post_image, regions, text):
                 self.risk.record(peer)
                 return SendResult(SendOutcome("verified", "bubble_confirmed"), header=header, changed=changed)
             if self._confirm_by_readback(text, post_image, regions):
                 self.risk.record(peer)
                 return SendResult(SendOutcome("verified", "readback_confirmed"), header=header, changed=changed)
-            last = SendResult(SendOutcome("uncertain", f"attempt={attempt + 1} changed={changed:.4f}"),
+
+            # 没看到「本次新增且内容相符」的我方气泡 —— 不重发，标记不确定交人工
+            last = SendResult(SendOutcome("uncertain", f"bubble_not_confirmed changed={changed:.4f}"),
                               header=header, changed=changed)
-            if attempt < attempts - 1:
-                time.sleep(0.4)
+            break
         return last
+
+    # ---------- 验收：只认本次新增、内容相符的我方气泡 ----------
+    def _outgoing_texts(self, image, regions: Regions):
+        if self.ocr is None or not self.ocr.available:
+            return []
+        try:
+            lines = self.ocr.recognize(image.crop(regions.messages))
+        except Exception:
+            return []
+        offset_x, offset_y = regions.messages[0], regions.messages[1]
+        chat_left = regions.chat[0]
+        width = max(1, regions.chat[2] - chat_left)
+        rows = []
+        for line in lines:
+            x1, y1, x2, _y2 = line.bbox
+            global_x1 = x1 + offset_x
+            center = (global_x1 + (x2 + offset_x)) / 2.0
+            if (center - chat_left) / width >= 0.55:      # 右侧 = 我方气泡
+                rows.append((y1 + offset_y, line.text))
+        rows.sort(key=lambda item: item[0])
+        return [text for _y, text in rows]
+
+    def _verify_new_bubble(self, pre_image, post_image, regions: Regions, text: str) -> bool:
+        before = self._outgoing_texts(pre_image, regions)
+        after = self._outgoing_texts(post_image, regions)
+
+        def count_similar(lines) -> int:
+            return sum(1 for line in lines if self._similar(line, text))
+
+        # 「同样内容的我方气泡」出现次数变多，才算本次新增
+        return count_similar(after) > count_similar(before)
+
 
     # ---------- 读回确认（失败重试前的幂等检查） ----------
     def _confirm_by_readback(self, text: str, image, regions: Regions) -> bool:

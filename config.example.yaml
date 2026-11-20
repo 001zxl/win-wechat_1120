@@ -1,4 +1,4 @@
-# 微信 AI 自动回复配置
+﻿# 微信 AI 自动回复配置
 # 复制为 config.yaml 后填写（config.yaml 已在 .gitignore 里）
 
 ai:
@@ -19,8 +19,8 @@ ai:
 
 runtime:
   poll_interval_s: 1.0
-  settle_s: 0.35
-  aggregate_max_wait_s: 1.2
+  settle_s: 0.8
+  aggregate_max_wait_s: 2.5
   cooldown_s: 3
   max_actions_per_min: 20
   max_unread_per_cycle: 3
@@ -112,3 +112,4 @@ layout:
   header_ratio: 0.09
   input_ratio: 0.22
   overrides: {}
+

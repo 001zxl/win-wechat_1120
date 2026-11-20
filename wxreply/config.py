@@ -64,8 +64,8 @@ class AIConfig:
 @dataclass
 class RuntimeConfig:
     poll_interval_s: float = 1.0
-    settle_s: float = 0.35
-    aggregate_max_wait_s: float = 1.2
+    settle_s: float = 0.8
+    aggregate_max_wait_s: float = 2.5
     cooldown_s: float = 3.0
     max_actions_per_min: int = 20
     max_unread_per_cycle: int = 3
@@ -160,6 +160,7 @@ class Config:
     base_dir: str = "."
     config_path: str = ""
     settings_path: str = "data/settings.json"
+    handoff_path: str = "data/handoff.json"     # 人工接管状态（持久化）
     channels: List[Dict[str, Any]] = field(default_factory=list)  # 全 IM 通道配置
     friend_personas: Dict[str, str] = field(default_factory=dict)  # 好友专属人设
 

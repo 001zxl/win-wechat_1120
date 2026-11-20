@@ -67,6 +67,8 @@ def build_system_prompt(
     ]
     if boundaries.get("price_policy"):
         lines.append(f"报价策略：{boundaries['price_policy']}。")
+    if boundaries.get("fact_policy"):
+        lines.append(f"事实约束：{boundaries['fact_policy']}。")
     if persona.forbidden_topics():
         lines.append("禁止话题：" + "、".join(persona.forbidden_topics()) + "。")
     if persona.must_escalate():

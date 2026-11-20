@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
 import sys
@@ -82,7 +82,7 @@ class TestChat(unittest.TestCase):
 
 class TestRag(unittest.TestCase):
     def test_bm25_hit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             with open(os.path.join(tmp, "a.md"), "w", encoding="utf-8") as handle:
                 handle.write("折叠桌 FT-120 报价 3.2 美金\n\n无关内容：天气很好。")
             kb = KnowledgeBase(tmp)
@@ -93,7 +93,7 @@ class TestRag(unittest.TestCase):
 
 class TestSenderSafety(unittest.TestCase):
     def test_abort_when_header_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             platform = MockPlatform()
             platform.force_open("李四")  # 当前会话不是目标
@@ -106,7 +106,7 @@ class TestSenderSafety(unittest.TestCase):
             self.assertEqual(platform.sent, [])
 
     def test_verified_send_on_mock(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             platform = MockPlatform()
             platform.force_open("张三")
@@ -120,7 +120,7 @@ class TestSenderSafety(unittest.TestCase):
 
 class TestAgentDryRun(unittest.TestCase):
     def test_cycle_produces_draft(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             platform = MockPlatform()
             from wxreply.agent import Agent
@@ -137,7 +137,7 @@ class TestMemory(unittest.TestCase):
     def test_memory_roundtrip(self) -> None:
         from wxreply.brain.memory import MemoryStore
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             store = MemoryStore(os.path.join(tmp, "m.db"), recent_limit=5, summarize_after=3)
             store.add("张三", "in", "text", "你好")
             store.add("张三", "out", "text", "在的")
@@ -158,7 +158,7 @@ class TestTools(unittest.TestCase):
 
         from wxreply.brain.tools import ToolBox
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             price_path = os.path.join(tmp, "price.json")
             with open(price_path, "w", encoding="utf-8") as handle:
                 json.dump({
@@ -194,7 +194,7 @@ class TestGroupPolicy(unittest.TestCase):
 
 class TestModelSwitch(unittest.TestCase):
     def test_switch_model(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             cfg.ai.models = [
                 {"id": "deepseek", "label": "DS", "model": "deepseek-chat"},
@@ -212,7 +212,7 @@ class TestModelSwitch(unittest.TestCase):
 
 class TestMediaMessage(unittest.TestCase):
     def test_image_event_and_prompt(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             platform = MockPlatform()
             platform.sessions[0].messages = [
@@ -248,7 +248,7 @@ class TestSetupChecks(unittest.TestCase):
 
 class TestUnreadBadge(unittest.TestCase):
     def test_unread_cleared_after_cycle(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             platform = MockPlatform()
             from wxreply.agent import Agent
@@ -259,7 +259,7 @@ class TestUnreadBadge(unittest.TestCase):
             self.assertEqual(conversations["张三"]["unread"], 0)
 
     def test_mark_read(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             from wxreply.agent import Agent
 
@@ -345,7 +345,7 @@ class TestInbound(unittest.TestCase):
 
     def test_handle_inbound_does_not_touch_wechat(self) -> None:
         import json
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             with open(cfg.tools.price_file, "w", encoding="utf-8") as handle:
                 json.dump({"products": [{"sku": "FT-120", "name": "折叠桌",
@@ -396,7 +396,7 @@ class TestChannels(unittest.TestCase):
 class TestSimulate(unittest.TestCase):
     def test_simulate_in_project(self) -> None:
         import json
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             with open(cfg.tools.price_file, "w", encoding="utf-8") as handle:
                 json.dump({
@@ -421,7 +421,7 @@ class TestSimulate(unittest.TestCase):
             self.assertEqual(history[1]["dir"], "out")
 
     def test_simulate_escalate(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             cfg.safety.escalate_keywords = ["投诉"]
             from wxreply.agent import Agent
@@ -436,7 +436,7 @@ class TestSettings(unittest.TestCase):
     def test_settings_overlay(self) -> None:
         import json
 
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             os.makedirs(os.path.join(tmp, "data"))
             with open(os.path.join(tmp, "config.yaml"), "w", encoding="utf-8") as handle:
                 handle.write("ai:\n  models:\n    - {id: ds, model: deepseek-chat}\n    - {id: qw, model: qwen-plus}\n")
@@ -453,7 +453,7 @@ class TestSettings(unittest.TestCase):
             self.assertEqual(options["qw"].api_key, "sk-test")
 
     def test_agent_apply_settings(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             cfg = make_config(tmp)
             cfg.ai.models = [{"id": "ds", "model": "deepseek-chat"},
                              {"id": "qw", "model": "qwen-plus"}]
@@ -470,3 +470,4 @@ class TestSettings(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

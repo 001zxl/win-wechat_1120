@@ -34,6 +34,16 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(ROOT, "web")
 
 
+def resolve_static_path(web_dir: str, rel: str) -> Optional[str]:
+    """把请求路径解析为 web/ 内的真实文件；越界（../、绝对路径）一律返回 None。"""
+    root = os.path.realpath(web_dir)
+    clean = (rel or "").split("?", 1)[0].lstrip("/").replace("\\", "/")
+    target = os.path.realpath(os.path.join(root, clean))
+    if target != root and not target.startswith(root + os.sep):
+        return None
+    return target if os.path.isfile(target) else None
+
+
 def seed_demo(platform) -> None:
     if not isinstance(platform, MockPlatform):
         return
@@ -179,6 +189,7 @@ class ConsoleState:
                     "group": self.cfg.runtime.allow_group_chat,
                     "memory": self.cfg.memory.db_path,
                     "whitelist_names": list(self.cfg.safety.whitelist),
+                    "handoffs": self.agent.handoff.items(),
                     "layout": self.agent.layout_ratios(),
                     "vision_model": self.cfg.ai.vision_model,
                     "embedding_model": self.cfg.ai.embedding_model,
@@ -274,6 +285,19 @@ class ConsoleState:
                 return {"ok": self.agent.open_conversation(peer)} if peer else {"ok": False}
             if action == "sync":
                 return {"ok": True, "peers": self.agent.sync_conversations(deep=True)}
+            if action == "takeover":
+                peer = str(payload.get("peer") or self.selected or "")
+                if not peer:
+                    return {"ok": False, "error": "缺少 peer"}
+                self.agent.takeover(peer, str(payload.get("reason") or "人工接管"))
+                return {"ok": True, "peer": peer}
+            if action == "release":
+                peer = str(payload.get("peer") or self.selected or "")
+                if not peer:
+                    return {"ok": False, "error": "缺少 peer"}
+                return {"ok": self.agent.release_handoff(peer), "peer": peer}
+            if action == "handoffs":
+                return {"ok": True, "items": self.agent.handoff.items()}
             if action == "offscreen":
                 platform = self.agent.platform
                 if not (hasattr(platform, "mount_offscreen") and hasattr(platform, "restore_from_offscreen")):
@@ -434,8 +458,9 @@ def make_handler(state: ConsoleState):
                 return
             if path == "/":
                 path = "/index.html"
-            file_path = os.path.join(WEB_DIR, path.lstrip("/"))
-            if not os.path.isfile(file_path):
+            # 静态目录必须锁死在 web/ 内：`/../config.yaml` 这类跳转一律 404
+            file_path = resolve_static_path(WEB_DIR, path)
+            if file_path is None:
                 self._send(404, b"not found", "text/plain; charset=utf-8")
                 return
             content_type = {
@@ -460,6 +485,26 @@ def make_handler(state: ConsoleState):
             self._send(200, json.dumps(result, ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
 
+        def _action_allowed(self) -> bool:
+            """操作接口的基本防护：只接受本机、JSON、可选口令。
+
+            浏览器同源请求会自动带 Origin，跨站页面伪造 POST 会被拒。
+            """
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                return False
+            host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+            if host not in ("127.0.0.1", "localhost", "[::1]", "::1"):
+                return False
+            origin = (self.headers.get("Origin") or "").strip().lower()
+            if origin and not any(origin.startswith(prefix) for prefix in (
+                    "http://127.0.0.1", "http://localhost", "http://[::1]")):
+                return False
+            token = os.environ.get("WX_CONSOLE_TOKEN", "").strip()
+            if token and (self.headers.get("X-Console-Token") or "").strip() != token:
+                return False
+            return True
+
         def do_POST(self) -> None:
             path = urlparse(self.path).path
             if path.startswith("/api/inbound/"):
@@ -467,6 +512,10 @@ def make_handler(state: ConsoleState):
                 return
             if path != "/api/action":
                 self._send(404, b"not found", "text/plain")
+                return
+            if not self._action_allowed():
+                self._send(403, b'{"ok":false,"error":"forbidden"}',
+                           "application/json; charset=utf-8")
                 return
             length = int(self.headers.get("Content-Length") or 0)
             try:

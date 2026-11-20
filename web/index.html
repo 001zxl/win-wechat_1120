@@ -221,7 +221,8 @@
       <div class="row2">
         <button class="primary" id="send">发送草稿</button>
         <button id="regen">重新生成</button>
-        <button class="danger" id="discard">转人工 / 丢弃</button>
+        <button class="danger" id="takeover">转人工</button>
+        <button id="discard">丢弃草稿</button>
         <span class="spacer"></span>
         <span class="chip" id="draftMeta"></span>
       </div>
@@ -481,6 +482,10 @@ function renderDraft() {
     if (draftKey) { draftKey = ""; }
   }
   ["send", "regen", "discard"].forEach((id) => { $(id).disabled = !mine; });
+  const taken = !!(state && state.status && (state.status.handoffs || [])
+    .some((item) => item.peer === selected));
+  $("takeover").disabled = !selected;
+  $("takeover").textContent = taken ? "恢复自动回复" : "转人工";
 }
 
 let eventSignature = "";
@@ -906,6 +911,14 @@ $("send").onclick = async () => {
 };
 $("regen").onclick = () => act("regen");
 $("discard").onclick = () => act("discard");
+$("takeover").onclick = async () => {
+  if (!selected) { alert("请先在左栏选中一个会话"); return; }
+  const taken = !!(state && state.status && (state.status.handoffs || [])
+    .some((item) => item.peer === selected));
+  const result = await act(taken ? "release" : "takeover", { peer: selected });
+  if (!result || !result.ok) alert(taken ? "恢复失败" : "转人工失败");
+  fetchState();
+};
 $("apply").onclick = () => act("instruction", { text: $("instruction").value });
 $("draft").addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) act("approve", { text: $("draft").value });

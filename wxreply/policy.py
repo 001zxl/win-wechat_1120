@@ -65,6 +65,20 @@ def is_name_matched_strict(ocr_text: Optional[str], names: List[str]) -> Tuple[b
     return False, None
 
 
+def _strip_decorations(text: str) -> str:
+    """去掉群人数后缀 (13)、尾部标点等，便于严格比对会话名。"""
+    value = _GROUP_SIZE.sub("", str(text or "")).strip()
+    value = re.sub(r"[\s·.．…⋯/，,。]+$", "", value)
+    return value
+
+
+def is_same_peer_strict(header_text: Optional[str], peer: str) -> bool:
+    """发送前的严格比对：只允许「人数后缀/尾部标点」这类无关差异。"""
+    left = normalize_name(_strip_decorations(header_text or ""))
+    right = normalize_name(_strip_decorations(peer or ""))
+    return bool(left) and left == right
+
+
 def is_service_account(text: Optional[str]) -> bool:
     normalized = normalize_name(text)
     if not normalized:
