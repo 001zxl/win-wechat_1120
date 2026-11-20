@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 import sys
@@ -227,10 +227,15 @@ class TestMediaMessage(unittest.TestCase):
             events = []
             while not agent.events.empty():
                 events.append(agent.events.get())
-            self.assertTrue(any(event["type"] == "media" for event in events))
+            media = [event for event in events if event["type"] == "media"]
+            self.assertTrue(media, "图片消息必须产生 media 事件")
+            self.assertIn(media[-1]["state"], ("detected", "unavailable", "failed"))
             pending = agent.pending_for("张三")
             self.assertIsNotNone(pending)
             self.assertIn("[图片]", pending["incoming"])
+            # 读不出图时只能追问，不能对着未知图片回答"有货/没货"
+            self.assertIn("文字", pending["reply"])
+            self.assertNotIn("有货", pending["reply"].split("方便")[0])
 
 
 class TestSetupChecks(unittest.TestCase):

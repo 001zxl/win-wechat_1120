@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from PIL import Image
+
+
+def _json(data: Optional[Dict[str, Any]]) -> str:
+    if not data:
+        return ""
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:
+        return ""
 
 
 class AuditStore:
@@ -39,7 +49,10 @@ class AuditStore:
                     detail TEXT,
                     model TEXT,
                     latency_ms INTEGER,
-                    evidence_path TEXT
+                    evidence_path TEXT,
+                    kb_provider TEXT,
+                    kb_version TEXT,
+                    kb_sources TEXT
                 )
                 """
             )
@@ -54,17 +67,25 @@ class AuditStore:
                     state TEXT,
                     detail TEXT,
                     evidence TEXT,
-                    event INTEGER DEFAULT 0
+                    event INTEGER DEFAULT 0,
+                    kb_provider TEXT,
+                    kb_version TEXT,
+                    kb_sources TEXT
                 )
                 """
             )
-            try:
-                columns = [row[1] for row in
-                           self._connection.execute("PRAGMA table_info(sends)").fetchall()]
-                if "event" not in columns:
-                    self._connection.execute("ALTER TABLE sends ADD COLUMN event INTEGER DEFAULT 0")
-            except Exception:
-                pass
+            # 老库平滑升级：缺哪列补哪列（不改已有数据）
+            self._add_columns("sends", {
+                "event": "INTEGER DEFAULT 0",
+                "kb_provider": "TEXT",
+                "kb_version": "TEXT",
+                "kb_sources": "TEXT",
+            })
+            self._add_columns("events", {
+                "kb_provider": "TEXT",
+                "kb_version": "TEXT",
+                "kb_sources": "TEXT",
+            })
             # 待重试队列：和发送台账同库，重启后仍能自动补回
             self._connection.execute(
                 """
@@ -82,6 +103,16 @@ class AuditStore:
             )
             self._connection.commit()
 
+    def _add_columns(self, table: str, columns: Dict[str, str]) -> None:
+        try:
+            existing = {row[1] for row in
+                        self._connection.execute(f"PRAGMA table_info({table})").fetchall()}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        except Exception:
+            pass
+
     def record(
         self,
         peer: str,
@@ -93,6 +124,7 @@ class AuditStore:
         model: str = "",
         latency_ms: int = 0,
         image: Optional[Image.Image] = None,
+        evidence: Optional[Dict[str, Any]] = None,
     ) -> None:
         now = time.time()
         if action == "skip":
@@ -114,24 +146,36 @@ class AuditStore:
                 image.save(evidence_path)
             except Exception:
                 evidence_path = ""
+        provider = str((evidence or {}).get("provider", ""))
+        version = str((evidence or {}).get("kb_version", ""))
+        sources = _json({"sources": (evidence or {}).get("sources") or [],
+                         "tool": (evidence or {}).get("tool") or []}) if evidence else ""
         with self._lock:
             self._connection.execute(
                 """
-                INSERT INTO events (ts, peer, action, incoming, reply, status, detail, model, latency_ms, evidence_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO events (ts, peer, action, incoming, reply, status, detail, model,
+                                    latency_ms, evidence_path, kb_provider, kb_version, kb_sources)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (time.time(), peer, action, incoming, reply, status, detail, model, latency_ms, evidence_path),
+                (time.time(), peer, action, incoming, reply, status, detail, model,
+                 latency_ms, evidence_path, provider, version, sources),
             )
             self._connection.commit()
 
     def record_send(self, peer: str, signature: str, text: str, state: str,
-                    detail: str = "", evidence: str = "", event: int = 0) -> None:
+                    detail: str = "", evidence: str = "", event: int = 0,
+                    knowledge: Optional[Dict[str, Any]] = None) -> None:
         """发送台账：按「会话 + 消息内容 + 轮次」记账，同一事件不重复发，新事件照常处理。"""
+        provider = str((knowledge or {}).get("provider", ""))
+        version = str((knowledge or {}).get("kb_version", ""))
+        sources = _json({"sources": (knowledge or {}).get("sources") or [],
+                         "tool": (knowledge or {}).get("tool") or []}) if knowledge else ""
         with self._lock:
             self._connection.execute(
-                "INSERT INTO sends (ts, peer, signature, text, state, detail, evidence, event) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (time.time(), peer, signature, text, state, detail, evidence, int(event)),
+                "INSERT INTO sends (ts, peer, signature, text, state, detail, evidence, event, "
+                "kb_provider, kb_version, kb_sources) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (time.time(), peer, signature, text, state, detail, evidence, int(event),
+                 provider, version, sources),
             )
             self._connection.commit()
 
@@ -190,7 +234,8 @@ class AuditStore:
     def recent(self, limit: int = 20):
         with self._lock:
             return self._connection.execute(
-                "SELECT ts, peer, action, status, reply, detail FROM events ORDER BY id DESC LIMIT ?",
+                "SELECT ts, peer, action, status, reply, detail, kb_provider, kb_version, kb_sources "
+                "FROM events ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
 

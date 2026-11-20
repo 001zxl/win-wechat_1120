@@ -5,8 +5,8 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -18,9 +18,17 @@ class Chunk:
     text: str
     source: str
     tokens: List[str]
+    # 检索结果的溯源信息：分数、片段 ID、知识库元数据（标题/文件名/版本等）
+    score: float = 0.0
+    chunk_id: str = ""
+    meta: Dict[str, Any] = field(default_factory=dict)
 
     def __str__(self) -> str:
         return self.text
+
+    def as_evidence(self) -> Dict[str, Any]:
+        return {"source": self.source, "score": self.score, "id": self.chunk_id,
+                "title": str((self.meta or {}).get("title", ""))}
 
 
 def _tokenize(text: str) -> List[str]:
@@ -32,20 +40,40 @@ def _tokenize(text: str) -> List[str]:
     return tokens
 
 
+_HEADING = re.compile(r"\n(?=#{1,6}\s)")
+
+
 def _split(text: str, max_chars: int = 400) -> List[str]:
-    parts = [part.strip() for part in re.split(r"\n{2,}|(?<=。)", text) if part.strip()]
+    """按 Markdown 标题切块，再按空行/句号合并。
+
+    不能把整份 FAQ 合成一个大块：那样"任意片段"都会命中所有主题，
+    依据判断就形同虚设（复查第 7 条）。
+    """
     chunks: List[str] = []
-    current = ""
-    for part in parts:
-        if len(current) + len(part) <= max_chars:
-            current += part
-        else:
-            if current:
-                chunks.append(current)
-            current = part
-    if current:
-        chunks.append(current)
+    for block in _HEADING.split(text or ""):
+        block = block.strip()
+        if not block:
+            continue
+        parts = [part.strip() for part in re.split(r"\n{2,}|(?<=。)", block) if part.strip()]
+        current = ""
+        for part in parts:
+            if len(current) + len(part) <= max_chars:
+                current += part
+            else:
+                if current:
+                    chunks.append(current)
+                current = part
+        if current:
+            chunks.append(current)
     return chunks
+
+
+def _ratio(scores: List[float], index: int) -> float:
+    """BM25 分数没有上界：换算成"相对最高分"的 0~1，便于展示和落库。"""
+    top = max(scores) if scores else 0.0
+    if top <= 0:
+        return 0.0
+    return max(0.0, scores[index] / top)
 
 
 class EmbeddingClient:
@@ -167,8 +195,13 @@ class KnowledgeBase:
                         content = handle.read()
                 except Exception:
                     continue
-                for piece in _split(content):
-                    self.chunks.append(Chunk(piece, os.path.relpath(path, self.directory), _tokenize(piece)))
+                for index, piece in enumerate(_split(content)):
+                    source = os.path.relpath(path, self.directory)
+                    self.chunks.append(Chunk(
+                        piece, source, _tokenize(piece),
+                        chunk_id=f"{source}#{index}",
+                        meta={"title": os.path.splitext(name)[0]},
+                    ))
         if not self.chunks:
             return
         self._avg_len = sum(len(chunk.tokens) for chunk in self.chunks) / len(self.chunks)
@@ -217,11 +250,13 @@ class KnowledgeBase:
         vectors = self._ensure_vectors()
         if vectors is None:
             order = sorted(range(len(self.chunks)), key=lambda i: bm25[i], reverse=True)
-            return [self.chunks[i] for i in order[:top_k] if bm25[i] > 0]
+            picked = [i for i in order[:top_k] if bm25[i] > 0]
+            return [self._with_score(i, _ratio(bm25, i)) for i in picked]
         query_vec = self.embeddings.embed([query]) if self.embeddings else None
         if not query_vec:
             order = sorted(range(len(self.chunks)), key=lambda i: bm25[i], reverse=True)
-            return [self.chunks[i] for i in order[:top_k] if bm25[i] > 0]
+            picked = [i for i in order[:top_k] if bm25[i] > 0]
+            return [self._with_score(i, _ratio(bm25, i)) for i in picked]
         q = query_vec[0]
         cosines = []
         for vector in vectors:
@@ -237,4 +272,8 @@ class KnowledgeBase:
         if not eligible:
             return []
         order = sorted(eligible, key=lambda i: fused[i], reverse=True)
-        return [self.chunks[i] for i in order[:top_k]]
+        return [self._with_score(i, max(0.0, cosines[i])) for i in order[:top_k]]
+
+    def _with_score(self, index: int, score: float) -> Chunk:
+        """返回带分数的副本：Chunk 是共享对象，不能就地改分。"""
+        return replace(self.chunks[index], score=round(float(score), 4))

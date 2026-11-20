@@ -81,37 +81,174 @@ class VisionOcr:
 
 
 class PaddleOcrBackend:
-    """PaddleOCR 可选后端：和 RapidOCR 做 A/B 对比时用（未安装则自动退回）。"""
+    """PaddleOCR 可选后端（3.x / 2.x 都兼容），用于和 RapidOCR 做 A/B 对比。
+
+    3.x 的返回体是 `OCRResult`（dict 子类，键为 rec_texts / rec_scores / rec_polys /
+    dt_polys / rec_boxes），2.x 是 [[box, (text, score)], ...] 的嵌套列表。
+    两种格式都在这里归一化成 OcrLine，业务侧不用关心装的是哪一版。
+    """
 
     name = "paddleocr"
+    # 3.x 新增 / 2.x 保留的参数名，初始化时按版本尝试
+    _V3_KWARGS = dict(lang="ch", use_doc_orientation_classify=False,
+                      use_doc_unwarping=False, use_textline_orientation=False)
 
     def __init__(self) -> None:
         from paddleocr import PaddleOCR  # type: ignore
 
-        try:
-            self._engine = PaddleOCR(use_angle_cls=True, lang="ch", show_log=False)
-        except TypeError:
-            self._engine = PaddleOCR(lang="ch")
+        self.version = str(getattr(PaddleOCR, "__version__", "")) or \
+            str(getattr(__import__("paddleocr"), "__version__", ""))
+        self._engine = None
+        errors = []
+        for kwargs in (self._V3_KWARGS,
+                       {"use_angle_cls": True, "lang": "ch", "show_log": False},
+                       {"lang": "ch"}):
+            try:
+                self._engine = PaddleOCR(**kwargs)
+                break
+            except (TypeError, ValueError) as exc:   # 版本不认这些参数就换下一组
+                errors.append(str(exc))
+        if self._engine is None:
+            raise RuntimeError("PaddleOCR 初始化失败：" + "；".join(errors[:2]))
 
+    # ---------- 推理 ----------
     def recognize(self, image: "Image.Image") -> List["OcrLine"]:
         import numpy as np
 
-        array = np.array(image.convert("RGB"))[:, :, ::-1]
-        raw = self._engine.ocr(array)
+        array = np.array(image.convert("RGB"))[:, :, ::-1]   # RGB -> BGR
+        raw = self._infer(array)
+        return self.parse_result(raw)
+
+    def _infer(self, array):
+        """3.x 推荐 predict()，2.x 只有 ocr()；方法不认就互换一次。"""
+        engine = self._engine
+        predict = getattr(engine, "predict", None)
+        ocr = getattr(engine, "ocr", None)
+        if callable(predict):
+            try:
+                return predict(array)
+            except (TypeError, ValueError):
+                if not callable(ocr):
+                    raise
+        return ocr(array)
+
+    # ---------- 结果解析（纯函数，便于离线回放官方样例） ----------
+    @classmethod
+    def parse_result(cls, raw) -> List["OcrLine"]:
         lines: List[OcrLine] = []
-        for page in raw or []:
-            for item in page or []:
-                try:
-                    box, payload = item[0], item[1]
-                    text = str(payload[0])
-                    score = float(payload[1])
-                except Exception:
-                    continue
-                points = np.array(box).reshape(-1, 2)
-                lines.append(OcrLine(text, (float(points[:, 0].min()), float(points[:, 1].min()),
-                                            float(points[:, 0].max()), float(points[:, 1].max())),
-                                     score))
+        for page in cls._pages(raw):
+            parsed = cls._parse_page(page)
+            lines.extend(parsed)
         return lines
+
+    @staticmethod
+    def _pages(raw) -> List:
+        if raw is None:
+            return []
+        if hasattr(raw, "json") or isinstance(raw, dict):
+            return [raw]
+        try:
+            seq = list(raw)
+        except TypeError:
+            return []
+        if not seq:
+            return []
+        first = seq[0]
+        # 2.x 单页形态：[ [box, (text, score)], ... ] —— 外面少一层 page 列表时补上
+        if isinstance(first, (list, tuple)) and len(first) == 2 and isinstance(first[1], tuple):
+            return [seq]
+        return seq
+
+    @classmethod
+    def _as_dict(cls, page) -> Optional[dict]:
+        """把 3.x 的 OCRResult 摊平成 {rec_texts, rec_scores, rec_polys, ...}。
+
+        3.x 的 OCRResult 是 dict 子类，内容挂在 `res` 键下（print 出来是 {'res': {...}}）；
+        它**不支持** res.rec_texts 属性访问，所以这里只认 key / .json / .res。
+        """
+        if isinstance(page, dict):
+            if "rec_texts" in page:
+                return page
+            inner = page.get("res")
+            if isinstance(inner, dict):
+                return inner
+            data = getattr(page, "json", None)
+            if isinstance(data, dict):
+                nested = data.get("res")
+                return nested if isinstance(nested, dict) else data
+            return None
+        data = getattr(page, "json", None)
+        if isinstance(data, dict):
+            inner = data.get("res")
+            return inner if isinstance(inner, dict) else data
+        try:
+            res = getattr(page, "res", None)
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def _parse_page(cls, page) -> List["OcrLine"]:
+        data = cls._as_dict(page)
+        if data is not None:
+            return cls._parse_v3(data)
+        return cls._parse_v2(page)
+
+    @classmethod
+    def _parse_v3(cls, data: dict) -> List["OcrLine"]:
+        texts = data.get("rec_texts")
+        if texts is None:
+            return []
+        scores = data.get("rec_scores")
+        scores = [] if scores is None else scores
+        polys = data.get("rec_polys")
+        if polys is None or len(polys) == 0:
+            polys = data.get("dt_polys")
+        if polys is None or len(polys) == 0:
+            polys = data.get("rec_boxes")
+        polys = [] if polys is None else list(polys)
+        lines: List[OcrLine] = []
+        for index, text in enumerate(texts):
+            text = str(text or "").strip()
+            if not text:
+                continue
+            try:
+                score = float(scores[index])
+            except (IndexError, TypeError, ValueError):
+                score = 1.0
+            box = polys[index] if index < len(polys) else None
+            lines.append(OcrLine(text, cls._box(box), score))
+        return lines
+
+    @classmethod
+    def _parse_v2(cls, page) -> List["OcrLine"]:
+        lines: List[OcrLine] = []
+        for item in page or []:
+            try:
+                box, payload = item[0], item[1]
+                text = str(payload[0] or "").strip()
+                score = float(payload[1])
+            except Exception:
+                continue
+            if not text:
+                continue
+            lines.append(OcrLine(text, cls._box(box), score))
+        return lines
+
+    @staticmethod
+    def _box(box) -> tuple:
+        if box is None:
+            return (0.0, 0.0, 0.0, 0.0)
+        points = np.array(box, dtype=float)
+        if points.ndim == 1 and points.size >= 4:      # [x1, y1, x2, y2]
+            x1, y1, x2, y2 = points[:4]
+            return (float(min(x1, x2)), float(min(y1, y2)),
+                    float(max(x1, x2)), float(max(y1, y2)))
+        points = points.reshape(-1, 2)
+        return (float(points[:, 0].min()), float(points[:, 1].min()),
+                float(points[:, 0].max()), float(points[:, 1].max()))
 
 
 class OcrEngine:
@@ -134,6 +271,23 @@ class OcrEngine:
     def load_error(self) -> Optional[str]:
         self._load()
         return self._load_error
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """不触发加载的最近一次错误（状态轮询用）。"""
+        return self._load_error
+
+    @property
+    def backend_name(self) -> str:
+        """实际生效的后端（控制台要显示，避免"配了 Paddle 却在跑 RapidOCR"）。
+
+        不强制加载模型：状态轮询不能因为没装 OCR 就卡住首屏。
+        """
+        if self._backend:
+            return self._backend
+        if self._tried:
+            return "none"
+        return self.preferred or "auto"
 
     def _load(self):
         if self._tried:

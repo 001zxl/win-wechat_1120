@@ -27,6 +27,7 @@ class AIConfig:
     model: str = "deepseek-chat"
     models: List[Any] = field(default_factory=list)   # [{id,label,model,base_url,api_key}]
     model_keys: Dict[str, str] = field(default_factory=dict)  # 控制台里按模型填的 key
+    revoked: List[str] = field(default_factory=list)  # 显式撤销的凭据：模型 id/名称、"vision"/"embedding"/"default"/"*"
     vision_model: str = ""                             # 图片理解用的视觉模型
     vision_base_url: str = ""
     vision_api_key: str = ""                           # 视觉单独凭据；空则仅在同网关时复用聊天 key
@@ -37,25 +38,96 @@ class AIConfig:
     max_tokens: int = 300
     timeout_s: float = 30.0
 
+    # ---------- 凭据撤销 ----------
+    def _revoked(self, *names: str) -> bool:
+        tokens = {str(item).strip().lower() for item in self.revoked if str(item).strip()}
+        if not tokens:
+            return False
+        if "*" in tokens:
+            return True
+        for name in names:
+            if name and str(name).strip().lower() in tokens:
+                return True
+        return False
+
+    def revoke(self, names: List[str]) -> List[str]:
+        """显式撤销凭据：写进 revoked，同时清掉内存里的 key。
+
+        留空不等于撤销（界面留空是"不修改"），必须有这个动作；
+        撤销之后 ready 必须立刻变 false，不能再从顶层 api_key 继承回来。
+        """
+        tokens = []
+        for name in names or []:
+            token = str(name or "").strip().lower()
+            if token and token not in tokens:
+                tokens.append(token)
+        merged = sorted({str(item).strip().lower() for item in self.revoked if str(item).strip()} | set(tokens))
+        self.revoked = merged
+        if "*" in merged or "default" in merged:
+            self.api_key = ""
+        if "*" in merged or self.model.strip().lower() in merged:
+            self.api_key = ""
+        for key in list(self.model_keys):
+            if "*" in merged or key.strip().lower() in merged:
+                self.model_keys.pop(key, None)
+        if "*" in merged or "vision" in merged:
+            self.vision_api_key = ""
+        if "*" in merged or "embedding" in merged:
+            self.embedding_api_key = ""
+        return merged
+
     def _fallback_key(self, base_url: str) -> str:
         """只有同一个网关时才允许复用聊天 key，避免 A 家 key 被发给 B 家。"""
+        if self._revoked("default"):
+            return ""
         if base_url and base_url.rstrip("/") != (self.base_url or "").rstrip("/"):
             return ""
         return self.api_key
+
+    def vision_key(self) -> str:
+        """视觉凭据：被撤销时一律为空，不能再从聊天 key 兜底回来。"""
+        if self._revoked("vision"):
+            return ""
+        if self.vision_api_key:
+            return self.vision_api_key
+        base = self.vision_base_url or self.base_url
+        return self._fallback_key(base) if self.vision_model else ""
+
+    def embedding_key(self) -> str:
+        """Embedding 凭据：同样不允许绕过撤销。"""
+        if self._revoked("embedding"):
+            return ""
+        if self.embedding_api_key:
+            return self.embedding_api_key
+        return self._fallback_key(self.embedding_base_url or self.base_url)
+
+    def key_for(self, option_id: str, model: str, base_url: str, stored: str = "") -> str:
+        """按「显式撤销 → 模型自己的 key → 同网关顶层 key」解析。
+
+        "default" 的撤销只影响顶层 api_key 的继承，不会连带作废用户重新录入的模型 key。
+        """
+        if self._revoked(option_id, model, "*"):
+            return ""
+        key = stored or self.model_keys.get(option_id) or ""
+        if not key and (not base_url or base_url.rstrip("/") == (self.base_url or "").rstrip("/")):
+            key = self.model_keys.get(model) or ""
+        if key:
+            return key
+        return self._fallback_key(base_url or self.base_url)
 
     def options(self) -> List[ModelOption]:
         result: List[ModelOption] = []
         for item in self.models or []:
             if isinstance(item, str):
-                result.append(ModelOption(id=item, label=item, model=item))
+                result.append(ModelOption(id=item, label=item, model=item,
+                                          api_key=self.key_for(item, item, self.base_url)))
             elif isinstance(item, dict):
                 model = str(item.get("model") or item.get("id") or "")
                 option_id = str(item.get("id") or model)
                 base_url = str(item.get("base_url") or "")
                 # 凭据按供应商隔离：只认这个模型自己的 key（含控制台填写的），不再"继承"全局 key
-                api_key = str(item.get("api_key") or self.model_keys.get(option_id) or "")
-                if not api_key and (not base_url or base_url.rstrip("/") == (self.base_url or "").rstrip("/")):
-                    api_key = self.model_keys.get(self.model) or ""
+                api_key = self.key_for(option_id, model, base_url,
+                                       stored=str(item.get("api_key") or ""))
                 result.append(ModelOption(
                     id=option_id,
                     label=str(item.get("label") or model),
@@ -65,7 +137,8 @@ class AIConfig:
                 ))
         if not result:
             result = [ModelOption(id=self.model, label=self.model, model=self.model,
-                                  base_url=self.base_url, api_key=self.api_key)]
+                                  base_url=self.base_url,
+                                  api_key=self.key_for(self.model, self.model, self.base_url))]
         return result
 
     def apply_option(self, option: ModelOption) -> None:
@@ -137,7 +210,13 @@ class RagConfig:
     provider: str = "local"       # local | weknora
     weknora_base_url: str = ""    # 例如 http://192.168.1.10:8080
     weknora_api_key: str = ""
-    weknora_search_path: str = "/api/v1/knowledge/search"
+    # 官方机器接口：POST /api/v1/knowledge-search，认证头 X-API-Key
+    weknora_search_path: str = "/api/v1/knowledge-search"
+    weknora_auth_header: str = "X-API-Key"
+    weknora_kb_ids: List[str] = field(default_factory=list)   # 知识库范围（可多个）
+    weknora_kb_id: str = ""                                   # 只挂一个知识库时的简写
+    weknora_tenant_id: str = ""                               # 平台级 key 需要 X-Tenant-ID
+    weknora_min_score: float = 0.0   # 官方分数阈值；0 表示只丢弃"明显的 0 分"
     min_score: float = 0.2
 
 
@@ -258,13 +337,20 @@ def _apply_settings_overlay(cfg: Config) -> None:
     except Exception:
         return
     keys = data.get("api_keys") or {}
+    revoked = [str(item) for item in (data.get("revoked") or []) if str(item).strip()]
     if isinstance(keys, dict):
-        cfg.ai.model_keys = {str(k): str(v) for k, v in keys.items() if v}
+        cfg.ai.model_keys = {str(k): str(v) for k, v in keys.items() if str(v).strip()}
+        # 空值表示"这个 key 被删了"，不能当成"没填过"再从顶层 api_key 继承回来
+        for key, value in keys.items():
+            if not str(value).strip():
+                revoked.append(str(key))
         # 视觉 / Embedding 的独立凭据（控制台用 "vision"/"embedding" 作为 key 名）
         if keys.get("vision"):
             cfg.ai.vision_api_key = str(keys["vision"])
         if keys.get("embedding"):
             cfg.ai.embedding_api_key = str(keys["embedding"])
+    if revoked:
+        cfg.ai.revoke(revoked)
     whitelist = data.get("whitelist")
     if isinstance(whitelist, list):
         cfg.safety.whitelist = [str(item) for item in whitelist if str(item).strip()]

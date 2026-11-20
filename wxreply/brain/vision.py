@@ -17,9 +17,9 @@ class VisionClient:
         self.config = config
         self.base_url = config.vision_base_url or config.base_url
         self.model = config.vision_model or config.model
-        # 视觉凭据独立：没有单独配置时，只在同一个网关下复用聊天 key
-        self.api_key = config.vision_api_key or (
-            config._fallback_key(self.base_url) if config.vision_model else "")
+        # 视觉凭据独立：没有单独配置时，只在同一个网关下复用聊天 key；
+        # 被显式撤销（revoked 含 "vision"）时一律为空
+        self.api_key = config.vision_key()
 
     @property
     def available(self) -> bool:

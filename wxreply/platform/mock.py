@@ -57,7 +57,8 @@ class MockPlatform:
     def __init__(self) -> None:
         self.window = WindowInfo(hwnd=1001, title="微信", class_name="Qt51514QWindowIcon")
         self.sessions: List[MockSession] = [
-            MockSession("张三", unread=2, messages=[("in", "在吗？"), ("in", "这款怎么卖？")]),
+            MockSession("张三", unread=2, messages=[("in", "在吗？"),
+                                                ("in", "想了解一下你们的产品")]),
             MockSession("李四", unread=0, messages=[("in", "上次的样品收到了"), ("out", "好的，有问题随时说～")]),
             MockSession("外贸客户-A", unread=1, messages=[("in", "请报个价，5000 件")]),
             MockSession("产品交流群(25)", unread=3, messages=[

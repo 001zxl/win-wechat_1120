@@ -17,6 +17,25 @@ class ToolResult:
     def as_dict(self) -> Dict[str, Any]:
         return {"name": self.name, "ok": self.ok, "summary": self.summary, "data": self.data}
 
+    @classmethod
+    def coerce(cls, value: Any) -> "ToolResult":
+        """工具结果在"草稿暂存 → 重新生成"之间来回传递，必须能安全还原。
+
+        历史上 pending 里存的是 as_dict() 的字典，重新生成时却按对象读 .ok 直接崩；
+        现在两侧统一走 coerce，字典和对象都能吃。
+        """
+        if isinstance(value, ToolResult):
+            return value
+        if isinstance(value, dict):
+            data = value.get("data")
+            return cls(
+                name=str(value.get("name") or ""),
+                ok=bool(value.get("ok")),
+                summary=str(value.get("summary") or ""),
+                data=data if isinstance(data, dict) else {},
+            )
+        return cls(name="", ok=False, summary=str(value or ""), data={})
+
 
 def _norm(text: str) -> str:
     return re.sub(r"\s+", "", (text or "")).lower()
@@ -55,6 +74,16 @@ class ToolBox:
         # 不做"只有一个产品就套用"的兜底：型号不明时必须问清楚，不能默认报价
         return None
 
+    def match_product(self, text: str) -> Optional[Dict[str, Any]]:
+        """对外暴露产品匹配：多轮指代补全要用。"""
+        return self._match_product(text)
+
+    def product_label(self, text: str) -> str:
+        item = self._match_product(text)
+        if not item:
+            return ""
+        return str(item.get("name") or item.get("sku") or "")
+
     @staticmethod
     def _parse_quantity(text: str) -> Optional[int]:
         # 必须带单位，避免把型号 FT-120 里的 120 当成数量；个位数也要能解析（"1件"）
@@ -79,11 +108,11 @@ class ToolBox:
         ranges = item.get("price_ranges") or []
         if not ranges:
             return ToolResult("price_lookup", False, "产品没有维护报价区间",
-                              {"sku": item.get("sku")})
+                              {"sku": item.get("sku"), "name": item.get("name")})
         if quantity is None:
             return ToolResult("price_lookup", False,
                               f"{item.get('name') or item.get('sku')} 的价格要看数量：请先问客户要多少件",
-                              {"sku": item.get("sku"), "need": "quantity"})
+                              {"sku": item.get("sku"), "name": item.get("name"), "need": "quantity"})
         matched = None
         for band in ranges:
             if band.get("min_qty", 0) <= quantity <= band.get("max_qty", 10**9):
@@ -92,7 +121,8 @@ class ToolBox:
         if matched is None:
             return ToolResult("price_lookup", False,
                               f"{quantity} 件不在任何已维护的报价档位内：需要业务确认，不要套用其它档位",
-                              {"sku": item.get("sku"), "quantity": quantity, "need": "band"})
+                              {"sku": item.get("sku"), "name": item.get("name"),
+                               "quantity": quantity, "need": "band"})
         low, high = matched.get("price", [None, None])
         summary = f"{item.get('name') or item.get('sku')}：{matched.get('min_qty')}-{matched.get('max_qty')} 件，FOB {low}-{high} 美金"
         return ToolResult("price_lookup", True, summary, {

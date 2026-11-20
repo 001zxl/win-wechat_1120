@@ -22,6 +22,7 @@ import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty
+from typing import List
 from urllib.parse import parse_qs, quote, urlparse
 
 from wxreply.agent import Agent
@@ -101,6 +102,8 @@ class ConsoleState:
         self.events = deque(maxlen=300)
         self.seq = 0
         self.lock = threading.Lock()
+        # 控制台访问令牌（WX_CONSOLE_TOKEN）被撤销后：这个值从此不再被接受
+        self.revoked_console_tokens: set = set()
         self.worker = threading.Thread(target=self.agent.run, daemon=True)
         self.worker.start()
         self.pump = threading.Thread(target=self._pump, daemon=True)
@@ -151,6 +154,7 @@ class ConsoleState:
     # ---------- 快照 ----------
     def snapshot(self) -> dict:
         with self.lock:
+            kb_status = self.agent.knowledge_status()
             pending = self.agent.pending_for(self.selected) if self.selected else self.agent.pending
             history = []
             if self.selected:
@@ -199,6 +203,10 @@ class ConsoleState:
                     "persona": self.agent.persona.display_name,
                     "kb": self.agent.kb.size,
                     "kb_version": self.agent.kb.version,
+                    "kb_provider": kb_status["provider"],
+                    "kb_remote_error": kb_status["remote_error"],
+                    "ocr_backend": kb_status["ocr_backend"],
+                    "ocr_error": kb_status["ocr_error"],
                     "whitelist": len(self.cfg.safety.whitelist),
                     "llm_ready": self.agent.router.client.ready,
                 },
@@ -208,6 +216,13 @@ class ConsoleState:
                 "pending": None if not pending else {
                     "peer": pending["peer"], "reply": pending["reply"],
                     "model": pending["model"], "latency_ms": pending["latency_ms"],
+                    # 版本号必须回传给前端：批准时后端会强制校验，缺了就拒发
+                    "draft_id": pending.get("draft_id", ""),
+                    "draft_version": int(pending.get("draft_version") or 1),
+                    "event_seq": int(pending.get("event_seq") or 0),
+                    "knowledge": pending.get("knowledge") or {},
+                    "verdict": pending.get("verdict") or {},
+                    "simulated": bool(pending.get("simulated")),
                 },
                 "events": events,
             }
@@ -264,11 +279,13 @@ class ConsoleState:
                     return {"ok": False, "error": "必须指定联系人（草稿与联系人绑定）",
                             "result": None}
                 result = self.agent.approve_pending(payload.get("text"), peer=peer,
-                                                    draft_id=payload.get("draft_id"))
+                                                    draft_id=payload.get("draft_id"),
+                                                    event_seq=payload.get("event_seq"))
                 return {"ok": bool(result and result.get("ok")), "result": result}
             if action == "regen":
-                result = self.agent.regenerate_pending(peer=self.selected)
-                return {"ok": bool(result), "result": result}
+                result = self.agent.regenerate_pending(peer=self.selected,
+                                                       draft_id=payload.get("draft_id"))
+                return {"ok": bool(result and result.get("ok")), "result": result}
             if action == "discard":
                 self.agent.discard_pending(peer=self.selected)
                 return {"ok": True}
@@ -307,8 +324,12 @@ class ConsoleState:
                 return {"ok": True, "items": self.agent.handoff.items()}
             if action == "kb_reload":
                 docs = self.agent.kb.reload()
-                self.agent.emit("status", message=f"知识库已重新加载：{docs} 段，版本 {self.agent.kb.version}")
-                return {"ok": True, "docs": docs, "version": self.agent.kb.version}
+                status = self.agent.knowledge_status()
+                self.agent.emit("status",
+                                message=(f"知识库已重新加载：{docs} 段，版本 {self.agent.kb.version}"
+                                         f"（后端 {status['provider']}）"))
+                return {"ok": True, "docs": docs, "version": self.agent.kb.version,
+                        "provider": status["provider"], "remote_error": status["remote_error"]}
             if action == "offscreen":
                 platform = self.agent.platform
                 if not (hasattr(platform, "mount_offscreen") and hasattr(platform, "restore_from_offscreen")):
@@ -346,10 +367,38 @@ class ConsoleState:
                 keys = payload.get("keys") or {}
                 if not isinstance(keys, dict):
                     return {"ok": False, "error": "keys must be an object"}
+                # delete 列表 = 显式删除（空字符串同样表示删除；留空不再是"不修改"）
+                for model_id in payload.get("delete") or []:
+                    keys[str(model_id)] = ""
                 self.settings.set_api_keys(keys)
                 self.settings.save()
                 self.agent.apply_settings(self.settings.data)
-                return {"ok": True}
+                return {"ok": True, "revoked": self.settings.revoked(),
+                        "llm_ready": self.agent.router.client.ready}
+            if action == "revoke_credentials":
+                raw = payload.get("targets") or payload.get("target") or ["all"]
+                targets = [raw] if isinstance(raw, str) else [str(item) for item in raw]
+                names: List[str] = []
+                for target in targets:
+                    token = target.strip()
+                    if token in ("all", "*"):
+                        names.extend(["*", "console"])
+                    elif token.startswith("model:"):
+                        names.append(token.split(":", 1)[1])
+                    elif token in ("vision", "embedding", "console", "default"):
+                        names.append(token)
+                if not names:
+                    return {"ok": False, "error": "没有可撤销的目标"}
+                self.settings.revoke(names)
+                self.settings.save()
+                self.agent.apply_settings(self.settings.data)
+                if "*" in names or "console" in names:
+                    current = os.environ.get("WX_CONSOLE_TOKEN", "").strip()
+                    if current:
+                        self.revoked_console_tokens.add(current)
+                return {"ok": True, "revoked": self.settings.revoked(),
+                        "llm_ready": self.agent.router.client.ready,
+                        "vision": self.agent.vision.available}
             if action == "whitelist":
                 names = payload.get("names") or []
                 if not isinstance(names, list):
@@ -524,7 +573,10 @@ def make_handler(state: ConsoleState):
                         (parsed.hostname or "") not in ("127.0.0.1", "localhost", "::1"):
                     return False
             token = os.environ.get("WX_CONSOLE_TOKEN", "").strip()
-            if token and (self.headers.get("X-Console-Token") or "").strip() != token:
+            presented = (self.headers.get("X-Console-Token") or "").strip()
+            if presented and presented in state.revoked_console_tokens:
+                return False        # 已撤销的控制台令牌，即使环境变量还在也不再接受
+            if token and presented != token:
                 return False
             return True
 

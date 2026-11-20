@@ -167,8 +167,51 @@ class TestWeKnoraAdapter(unittest.TestCase):
             {"content": "FT-120 售价 2.9-3.3 美金", "source": "price.md", "score": 0.8},
             "纯文本片段",
         ]})
-        self.assertEqual(len(hits), 2)
+        # 0 分片段不能当"有依据"：有正分命中时，0 分会被丢掉
+        self.assertEqual(len(hits), 1)
         self.assertEqual(hits[0].source, "price.md")
+
+    def test_official_envelope_and_fields(self) -> None:
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        payload = {
+            "success": True,
+            "data": [{
+                "id": "chunk-00000001",
+                "content": "偏远地区（西藏/新疆）走邮政小包，运费另计。",
+                "knowledge_id": "knowledge-00000001",
+                "knowledge_base_id": "kb-00000001",
+                "knowledge_title": "配送说明",
+                "knowledge_filename": "shipping.md",
+                "score": 0.95,
+                "metadata": {"model_score": 0.95},
+            }],
+            "meta": {"rerank": {"applied": True}},
+        }
+        hits = WeKnoraClient.parse_hits(payload)
+        self.assertEqual(len(hits), 1)
+        hit = hits[0]
+        self.assertEqual(hit.text[:4], "偏远地区")
+        self.assertEqual(hit.source, "shipping.md")
+        self.assertEqual(hit.title, "配送说明")
+        self.assertEqual(hit.chunk_id, "chunk-00000001")
+        self.assertEqual(hit.kb_id, "kb-00000001")
+        self.assertAlmostEqual(hit.score, 0.95, places=3)
+
+    def test_request_contract(self) -> None:
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        client = WeKnoraClient("http://127.0.0.1:8080/", "sk-test",
+                               kb_ids=["kb-1", "kb-2"], tenant_id="tenant-1")
+        self.assertEqual(client.search_path, "/api/v1/knowledge-search")
+        headers = client.headers()
+        self.assertEqual(headers.get("X-API-Key"), "sk-test", "官方机器接口用 X-API-Key")
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(headers.get("X-Tenant-ID"), "tenant-1")
+        body = client.payload("部署要求", 5)
+        self.assertEqual(body["query"], "部署要求")
+        self.assertEqual(body["match_count"], 5, "官方字段是 match_count，不是 top_k")
+        self.assertEqual(body["knowledge_base_ids"], ["kb-1", "kb-2"])
 
     def test_search_failure_returns_empty(self) -> None:
         from wxreply.brain.kb_weknora import WeKnoraClient
@@ -176,6 +219,87 @@ class TestWeKnoraAdapter(unittest.TestCase):
         client = WeKnoraClient("http://127.0.0.1:9")
         self.assertEqual(client.search("报价"), [])
         self.assertTrue(client.last_error)
+
+
+class TestWeKnoraHttp(unittest.TestCase):
+    """按官方契约发请求、按官方信封收结果（离线回放，不连真实服务）。"""
+
+    def _client(self, monkeypatch_response):
+        import wxreply.brain.kb_weknora as kb_module
+
+        captured = {}
+
+        class FakeResponse:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured.update(url=url, json=json, headers=headers)
+            return monkeypatch_response(FakeResponse)
+
+        original = kb_module.requests.post
+        kb_module.requests.post = fake_post
+        self.addCleanup(lambda: setattr(kb_module.requests, "post", original))
+        return captured
+
+    def test_round_trip(self) -> None:
+        captured = self._client(lambda Fake: Fake(200, {
+            "success": True,
+            "data": [{
+                "id": "chunk-1",
+                "content": "偏远地区可以配送，运费另计。",
+                "knowledge_id": "knowledge-1",
+                "knowledge_base_id": "kb-1",
+                "knowledge_title": "配送说明",
+                "knowledge_filename": "shipping.md",
+                "score": 0.95,
+                "metadata": {"model_score": 0.95},
+            }],
+            "meta": {"rerank": {"applied": True}},
+        }))
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        client = WeKnoraClient("http://kb.local/", "sk-1", kb_ids=["kb-1"])
+        hits = client.search("西藏 配送", top_k=4)
+        self.assertEqual(captured["url"], "http://kb.local/api/v1/knowledge-search")
+        self.assertEqual(captured["headers"]["X-API-Key"], "sk-1")
+        self.assertEqual(captured["json"]["match_count"], 4)
+        self.assertEqual(captured["json"]["knowledge_base_ids"], ["kb-1"])
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0].source, "shipping.md")
+        self.assertEqual(client.last_error, "")
+
+    def test_401_is_reported(self) -> None:
+        self._client(lambda Fake: Fake(401, {
+            "success": False, "error": {"code": 1001, "message": "unauthorized"}}))
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        client = WeKnoraClient("http://kb.local", "bad")
+        self.assertEqual(client.search("配送"), [])
+        self.assertIn("API Key", client.last_error)
+        self.assertIn("401", client.last_error)
+
+    def test_success_false_body_is_error(self) -> None:
+        self._client(lambda Fake: Fake(200, {
+            "success": False, "error": {"code": 1002, "message": "forbidden"}}))
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        client = WeKnoraClient("http://kb.local", "sk-1")
+        self.assertEqual(client.search("配送"), [])
+        self.assertTrue(client.last_error)
+
+    def test_zero_score_hits_dropped(self) -> None:
+        from wxreply.brain.kb_weknora import WeKnoraClient
+
+        hits = WeKnoraClient.parse_hits({"success": True, "data": [
+            {"content": "相关片段", "score": 0.9},
+            {"content": "凑数片段", "score": 0.0},
+        ]})
+        self.assertEqual([hit.text for hit in hits], ["相关片段"])
 
 
 class TestKnowledgeTriage(unittest.TestCase):
@@ -191,7 +315,9 @@ class TestKnowledgeTriage(unittest.TestCase):
             cfg.tools.price_file = os.path.join(tmp, "missing_prices.json")
             platform = MockPlatform()
             platform.current = 0
-            platform.sessions[0].messages = [{"dir": "in", "kind": "text", "text": "这个多少钱？"}]
+            # 已点名型号但库里没有：不能"问一下型号"糊过去，必须转人工
+            platform.sessions[0].messages = [{"dir": "in", "kind": "text",
+                                              "text": "ZX-999 多少钱？"}]
             agent = Agent(cfg, platform, dry_run=True)
             items = platform.read_incoming_items()
             image = platform.capture()
@@ -201,6 +327,39 @@ class TestKnowledgeTriage(unittest.TestCase):
             self.assertTrue(agent.handoff.is_taken("张三"),
                             "没有可靠依据的价格问题必须转人工")
             self.assertNotIn("张三", agent._pending)
+            agent.close()
+
+    def test_missing_model_asks_instead_of_quoting(self) -> None:
+        from wxreply.agent import Agent
+        from wxreply.platform.mock import MockPlatform
+        from tests.test_reliability import make_config
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            cfg = make_config(tmp)
+            cfg.kb_dir = os.path.join(tmp, "empty_kb")
+            os.makedirs(cfg.kb_dir, exist_ok=True)
+            cfg.tools.price_file = os.path.join(tmp, "missing_prices.json")
+            platform = MockPlatform()
+            platform.current = 0
+            platform.sessions[0].messages = [{"dir": "in", "kind": "text",
+                                              "text": "这个多少钱？"}]
+            agent = Agent(cfg, platform, dry_run=True)
+            called = {"n": 0}
+
+            def fake_generate(*_a, **_k):
+                called["n"] += 1
+                return ("报价 5 美金", "fake", 1)
+
+            agent._generate = fake_generate
+            items = platform.read_incoming_items()
+            image = platform.capture()
+            regions = agent.layout.regions(image.width, image.height)
+            agent._respond("张三", items, image, regions, False)
+            self.assertEqual(called["n"], 0, "没有型号时不能调用模型编报价")
+            draft = agent.pending_for("张三")
+            self.assertIsNotNone(draft)
+            self.assertIn("哪一款", draft["reply"])
+            self.assertNotIn("美金", draft["reply"])
             agent.close()
 
 

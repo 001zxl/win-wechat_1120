@@ -162,6 +162,32 @@ Windows 一键安装：[setup.bat](setup.bat)（装依赖 + RapidOCR + doctor �
 - 价格/库存类问题无工具结果、无知识依据时直接转人工，不再让模型猜
 - 详细方案与分阶段计划见 [docs/接入方案.md](docs/接入方案.md)
 
+WeKnora 按官方机器接口对接（v0.3.0+）：
+
+```
+POST {base_url}/api/v1/knowledge-search      # 知识片段检索（不是 /api/v1/knowledge/search，那是文件搜索）
+X-API-Key: <原始 key>                        # 没有 Bearer 前缀
+X-Tenant-ID: <空间 ID>                       # 平台级 key 必填；空间级 key 可省
+{"query": "...", "knowledge_base_ids": ["kb-1"], "match_count": 5}   # 官方字段是 match_count，不是 top_k
+```
+
+返回 `{"success": true, "data": [{content, score, knowledge_title, knowledge_filename, knowledge_id, ...}]}`；
+401/403 带 `error.code`（1001/1002）。适配层会保留来源、文件名、标题、分数，并把 0 分片段丢掉。
+
+## v0.6 本轮复查整改（9 项）
+
+1. **追加消息复检**：每一轮生成前都重新取工具/知识并重跑依据判定；生成期间客户补一句"ZX-999 多少钱"不会再被旧答案带过去。
+2. **无依据分流覆盖**：从"价格关键词"扩到 9 类事实（价格/库存/配送/售后/规格/付款/交期/认证/公司信息）。缺依据时能问清的先追问（型号/数量），问不清的转人工；追问话术是固定文本，模型不能改写。
+3. **图片有确定出口**：区分"检测到图 / 取到文件 / 理解成功 / 理解失败 / 没有视觉模型"，读不出图先追问一次文字，同一张图还读不出就转人工；媒体检测不再依赖视觉模型（`detect_media` 恒为开）。
+4. **工具结果类型统一**：草稿里存 `ToolResult` 对象，`ToolResult.coerce()` 兼容历史字典形态，带报价查询的草稿可以正常"重新生成"。
+5. **草稿版本闭合**：重新生成一定换新的 `draft_id` 并递增版本；批准接口强制要求 `draft_id`（缺了直接拒），可选 `event_seq` 校验，旧版本/别的会话/过批次一律 `stale`。
+6. **PaddleOCR 3.x 兼容**：同时支持 3.x 的 `OCRResult`（`{'res': {rec_texts, rec_scores, rec_polys, rec_boxes}}`）与 2.x 的嵌套列表；初始化参数按 3.x 优先、2.x 兜底；优先调用 `predict()`。
+7. **远端依据质量**：解析 `knowledge_title / knowledge_filename / knowledge_id / chunk_id / metadata`，分数保留到 `Chunk`；0 分片段在有正分命中时丢弃；草稿与审计都带上「知识后端 + 版本 + 来源 + 分数」。
+8. **多轮指代进检索**：记住本会话确认过的型号，`这个多少钱` 这类指代会把历史型号拼进检索 query；出现多个型号时先追问，不再"有知识却反复转人工"。
+9. **凭据撤销**：设置面板每个模型都有「删除」，另有「撤销全部凭据」；留空 = 删除（不再等于"不修改"），撤销后立即变为未就绪、且不会从顶层 `ai.api_key` 继承回来；控制台令牌被撤销后不再接受。
+
+配套：`kb/` 按 Markdown 标题切块（避免整份 FAQ 变成一块、"任意片段"命中所有主题）；`data/price_list.json` 缺省用 `price_list.example.json` 复制；新增 `tests/test_hardening.py`（36 项）覆盖以上 9 条；逐项说明与未验证项见 [docs/复查记录-v0.6.md](docs/复查记录-v0.6.md)。
+
 ## v0.5 正式自动发送前的整改
 
 **A 类（发错人 / 错发 / 授权失效）**
@@ -223,15 +249,17 @@ wxreply/perception/media.py 图片块检测（Windows）
 wxreply/config.py       配置加载
 wxreply/platform/       平台层：base(协议) / win32 / mock
 wxreply/perception/     layout / unread / ocr / chat
-wxreply/brain/          persona / llm / rag
+wxreply/brain/          persona / llm / rag / evidence / kb_weknora / tools / vision
 wxreply/executor/       sender（安全链）/ keyboard
 wxreply/policy.py       白名单、护栏、限频
 wxreply/agent.py        主循环
-wxreply/audit.py        SQLite 审计 + 证据截图
+wxreply/audit.py        SQLite 审计 + 证据截图（含知识版本/来源）
+wxreply/settings.py     控制台写回的设置（Key/白名单/布局/撤销）
 config.example.yaml     配置模板
+price_list.example.json 报价表样例（复制到 data/price_list.json 后改真实价格）
 personas/               人设
-kb/                     知识库（放 .md/.txt）
-tests/                  离线单测（macOS 可跑）
+kb/                     知识库（放 .md/.txt，按标题切块）
+tests/                  离线单测（含 test_hardening.py：本轮 9 项复查）
 scripts/make_mock_frames.py  生成 mock 截图
 ```
 
@@ -239,8 +267,8 @@ scripts/make_mock_frames.py  生成 mock 截图
 
 1. 微信登录，`run.py capture` 抓图核对布局比例（不同版本/DPI 可能要微调 `layout`）
 2. 白名单填真实联系人名称（与微信显示名一致，支持 OCR 容错变体）
-3. `run.py doctor` 全绿（RapidOCR 能装就装，装不上只能跑结构化/mock）
-4. 先 `dry_run: true` 跑 2~3 天，人工看审计里的草稿质量
+3. 把 `price_list.example.json` 复制成 `data/price_list.json` 并换成真实价格/库存；`kb/` 换成审核过的 FAQ
+4. `run.py doctor` 全绿；先 `dry_run: true` 跑 2~3 天，人工看审计里的草稿质量（含依据来源）
 5. 人设评测通过后开 `--live`，从 1 个白名单好友开始，观察 24h
 
 ## 风险与边界

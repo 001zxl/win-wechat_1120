@@ -11,12 +11,21 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from PIL import Image
 
 from .audit import AuditStore
+from .brain.evidence import (
+    Evidence,
+    Verdict,
+    decide as evidence_decide,
+    find_unsupported_claim,
+    has_pronoun,
+    has_sku,
+    skus_in,
+)
 from .brain.llm import ModelRouter
 from .brain.memory import MemoryStore
 from .brain.persona import Persona, build_system_prompt, load_persona
 from .brain.rag import EmbeddingClient, KnowledgeBase
 from .brain.kb_weknora import WeKnoraClient, as_chunks as weknora_chunks
-from .brain.tools import ToolBox
+from .brain.tools import ToolBox, ToolResult
 from .brain.vision import VisionClient
 from .config import Config
 from .executor.sender import SafeSender
@@ -101,8 +110,7 @@ class Agent:
         self.embeddings = EmbeddingClient(
             config.ai.embedding_model,
             config.ai.embedding_base_url or config.ai.base_url,
-            config.ai.embedding_api_key or config.ai._fallback_key(
-                config.ai.embedding_base_url or config.ai.base_url),
+            config.ai.embedding_key(),
             config.resolve(config.rag.embedding_cache),
         )
         self.kb = KnowledgeBase(config.resolve(config.kb_dir), config.rag.mode, self.embeddings)
@@ -110,6 +118,10 @@ class Agent:
         self.weknora = WeKnoraClient(
             config.rag.weknora_base_url, config.rag.weknora_api_key,
             config.rag.weknora_search_path,
+            auth_header=config.rag.weknora_auth_header,
+            kb_ids=config.rag.weknora_kb_ids, kb_id=config.rag.weknora_kb_id,
+            tenant_id=config.rag.weknora_tenant_id,
+            min_score=config.rag.weknora_min_score,
         ) if str(config.rag.provider).lower() == "weknora" else None
         self.router = ModelRouter(config.ai, dry_run=self.dry_run)
         self.router.client.dry_run = not self.router.client.ready
@@ -179,6 +191,9 @@ class Agent:
         self._row_index: List[Tuple[str, float]] = []   # 可见行 (名字, 全局 y)：红点行 → 会话名
         self._event_seq: Dict[str, int] = {}            # 每个会话的事件轮次
         self._event_state: Dict[str, Dict[str, Any]] = {}
+        self._product_ctx: Dict[str, Dict[str, Any]] = {}   # 每个会话最近确认过的产品/型号
+        self._media_asked: Dict[str, set] = {}          # 已经追问过的图片，避免反复刷同一句
+        self._vision_cache: Dict[str, str] = {}         # 图片路径 → 视觉描述（避免重复调模型）
         self._deep_page: Optional[int] = None
         self._last_error: str = ""
         self._reading: set = set()
@@ -232,10 +247,24 @@ class Agent:
         return image, self.layout.regions(image.width, image.height)
 
     def apply_settings(self, data: Dict[str, Any]) -> None:
-        """控制台保存设置后热更新：Key / 白名单 / 布局 / 视觉与向量模型。"""
+        """控制台保存设置后热更新：Key / 撤销 / 白名单 / 布局 / 视觉与向量模型。"""
         keys = data.get("api_keys") or {}
+        revoked = [str(item) for item in (data.get("revoked") or []) if str(item).strip()]
         if isinstance(keys, dict):
-            self.config.ai.model_keys = {str(k): str(v) for k, v in keys.items() if v}
+            self.config.ai.model_keys = {str(k): str(v) for k, v in keys.items() if str(v).strip()}
+            # 空值 = 明确删除：记进撤销名单，防止又从顶层 ai.api_key 继承回来
+            for key, value in keys.items():
+                if not str(value).strip():
+                    revoked.append(str(key))
+            if keys.get("vision"):
+                self.config.ai.vision_api_key = str(keys["vision"])
+            if keys.get("embedding"):
+                self.config.ai.embedding_api_key = str(keys["embedding"])
+        # 以设置文件为准重建撤销名单：用户重新录入 key 后必须能恢复可用
+        self.config.ai.revoked = []
+        if revoked:
+            merged = self.config.ai.revoke(revoked)
+            self.emit("settings", message="已撤销凭据：" + "、".join(merged))
         whitelist = data.get("whitelist")
         if isinstance(whitelist, list):
             self.config.safety.whitelist = [str(item) for item in whitelist if str(item).strip()]
@@ -255,15 +284,18 @@ class Agent:
             )
         if isinstance(data.get("vision_model"), str):
             self.config.ai.vision_model = data["vision_model"]
-            self.vision = VisionClient(self.config.ai)
         if isinstance(data.get("embedding_model"), str):
             self.config.ai.embedding_model = data["embedding_model"]
-            self.embeddings = EmbeddingClient(
-                self.config.ai.embedding_model, self.config.ai.base_url, self.config.ai.api_key,
-                self.config.resolve(self.config.rag.embedding_cache),
-            )
-            self.kb = KnowledgeBase(self.config.resolve(self.config.kb_dir),
-                                    self.config.rag.mode, self.embeddings)
+        # 凭据变了：视觉 / 向量 / 知识库客户端全部重建，不能继续用旧 key
+        self.vision = VisionClient(self.config.ai)
+        self.embeddings = EmbeddingClient(
+            self.config.ai.embedding_model,
+            self.config.ai.embedding_base_url or self.config.ai.base_url,
+            self.config.ai.embedding_key(),
+            self.config.resolve(self.config.rag.embedding_cache),
+        )
+        self.kb = KnowledgeBase(self.config.resolve(self.config.kb_dir),
+                                self.config.rag.mode, self.embeddings)
         # 重建模型路由（保留当前模型）
         current = self.router.current
         self.router = ModelRouter(self.config.ai, dry_run=self.dry_run)
@@ -549,19 +581,61 @@ class Agent:
             return {"peer": peer, "incoming": text, "reply": label, "auto": True,
                     "model": "guardrail", "latency_ms": 0, "tools": [],
                     "escalated": True}
-        tool_results = self.tools.prefetch(text)
+        # 模拟会话同样要过依据闸门：假模型报价不能借"模拟"绕过证据检查
+        query, ambiguous = self._context_query(peer, text, history)
+        tool_results = [ToolResult.coerce(item) for item in self.tools.prefetch(query)]
         for result in tool_results:
             self.emit("tool", name=result.name, summary=result.summary, ok=result.ok,
                       simulated=True)
-        reply, model, latency = self._generate(
-            [text], text, history, profile, tool_results, is_group_name(peer), peer=peer
-        )
-        if reply is None:  # 偶发网络/限流，重试一次
+        chunks, kb_meta = self._search_knowledge(query)
+        evidence = Evidence(tool_results=tool_results, chunks=chunks,
+                            provider=kb_meta.get("provider", "local"),
+                            kb_version=kb_meta.get("version", ""),
+                            kb_error=kb_meta.get("error", ""))
+        self._remember_product(peer, query, evidence)
+        verdict = evidence_decide(text, evidence, product_hint=query,
+                                  ambiguous_product=ambiguous)
+        if verdict.action == "handoff":
+            self.handoff.take(peer, verdict.reason or "没有可靠依据")
+            label = f"（转人工）{verdict.reason}"
+            view.append(("out", label))
+            self.memory.add(peer, "out", "text", label)
+            self._touch(peer, status="转人工", unread=0, text=label)
+            self.audit.record(peer=peer, action="simulate", status="no_evidence:" +
+                              ",".join(verdict.missing), incoming=text, reply=label,
+                              detail=verdict.reason, evidence=evidence.summary())
+            self.emit("simulate", peer=peer, incoming=text, reply=label, auto=True,
+                      model="evidence", latency_ms=0, tools=[], escalated=True,
+                      missing=verdict.missing)
+            return {"peer": peer, "incoming": text, "reply": label, "auto": True,
+                    "model": "evidence", "latency_ms": 0,
+                    "tools": [r.name for r in tool_results], "escalated": True}
+        if verdict.action == "ask":
+            reply, model, latency = verdict.reply, "rule", 0
+        else:
             reply, model, latency = self._generate(
-                [text], text, history, profile, tool_results, is_group_name(peer)
+                [text], text, history, profile, tool_results, is_group_name(peer), peer=peer,
+                chunks=chunks
             )
-        if reply is None:
-            return None
+            if reply is None:  # 偶发网络/限流，重试一次
+                reply, model, latency = self._generate(
+                    [text], text, history, profile, tool_results, is_group_name(peer)
+                )
+            if reply is None:
+                return None
+            unsupported = find_unsupported_claim(reply, evidence.text(), text)
+            if unsupported:
+                reason = f"回复里的「{unsupported}」在依据里找不到"
+                self.handoff.take(peer, reason)
+                label = f"（转人工）{reason}"
+                view.append(("out", label))
+                self.memory.add(peer, "out", "text", label)
+                self._touch(peer, status="转人工", unread=0, text=label)
+                self.emit("simulate", peer=peer, incoming=text, reply=label, auto=True,
+                          model="evidence", latency_ms=0, tools=[], escalated=True)
+                return {"peer": peer, "incoming": text, "reply": label, "auto": True,
+                        "model": "evidence", "latency_ms": 0,
+                        "tools": [r.name for r in tool_results], "escalated": True}
         if auto:
             view.append(("out", reply))
             self.memory.add(peer, "out", "text", reply)
@@ -571,8 +645,12 @@ class Agent:
                 "peer": peer, "reply": reply, "incoming": text, "image": None,
                 "regions": None, "model": model, "latency_ms": latency,
                 "incoming_items": [text], "history": history, "profile": profile,
-                "tool_results": [r.as_dict() for r in tool_results],
+                "tool_results": list(tool_results),
                 "is_group": is_group_name(peer), "simulated": True,
+                "event_key": normalize_name(text), "event_seq": 0,
+                "signature": normalize_name(text),
+                "draft_id": uuid.uuid4().hex, "draft_version": 1,
+                "knowledge": evidence.summary(), "evidence": evidence,
             }
             if peer in self._pending_order:
                 self._pending_order.remove(peer)
@@ -582,10 +660,10 @@ class Agent:
         self._conv[peer]["simulated"] = True
         self.audit.record(peer=peer, action="simulate", status=status,
                           incoming=text, reply=reply, model=model, latency_ms=latency,
-                          detail="项目内模拟，未操作真实微信")
+                          detail="项目内模拟，未操作真实微信", evidence=evidence.summary())
         self.emit("simulate", peer=peer, incoming=text, reply=reply, auto=auto,
                   model=model, latency_ms=latency,
-                  tools=[r.name for r in tool_results])
+                  tools=[r.name for r in tool_results], knowledge=evidence.summary())
         return {"peer": peer, "incoming": text, "reply": reply, "auto": auto,
                 "model": model, "latency_ms": latency,
                 "tools": [r.summary for r in tool_results]}
@@ -609,12 +687,43 @@ class Agent:
             self._touch(peer, status="转人工", unread=0, text=reply)
             self.emit("inbound", peer=peer, incoming=text, reply=reply, escalated=True)
             return {"peer": peer, "incoming": text, "reply": reply, "escalated": True}
-        tool_results = self.tools.prefetch(text)
-        reply, model, latency = self._generate(
-            [text], text, history, profile, tool_results, is_group_name(peer), peer=peer
-        )
-        if reply is None:
-            return None
+        query, ambiguous = self._context_query(peer, text, history)
+        tool_results = [ToolResult.coerce(item) for item in self.tools.prefetch(query)]
+        chunks, kb_meta = self._search_knowledge(query)
+        evidence = Evidence(tool_results=tool_results, chunks=chunks,
+                            provider=kb_meta.get("provider", "local"),
+                            kb_version=kb_meta.get("version", ""),
+                            kb_error=kb_meta.get("error", ""))
+        self._remember_product(peer, query, evidence)
+        verdict = evidence_decide(text, evidence, product_hint=query,
+                                  ambiguous_product=ambiguous)
+        if verdict.action == "handoff":
+            reply = f"（转人工）{verdict.reason}"
+            view.append(("out", reply))
+            self.memory.add(peer, "out", "text", reply)
+            self._touch(peer, status="转人工", unread=0, text=reply)
+            self.audit.record(peer=peer, action="inbound", status="no_evidence",
+                              incoming=text, reply=reply, detail=verdict.reason,
+                              evidence=evidence.summary())
+            self.emit("inbound", peer=peer, incoming=text, reply=reply, escalated=True)
+            return {"peer": peer, "incoming": text, "reply": reply, "escalated": True}
+        if verdict.action == "ask":
+            reply, model, latency = verdict.reply, "rule", 0
+        else:
+            reply, model, latency = self._generate(
+                [text], text, history, profile, tool_results, is_group_name(peer),
+                peer=peer, chunks=chunks
+            )
+            if reply is None:
+                return None
+            unsupported = find_unsupported_claim(reply, evidence.text(), text)
+            if unsupported:
+                reply = f"（转人工）回复里的「{unsupported}」没有依据"
+                view.append(("out", reply))
+                self.memory.add(peer, "out", "text", reply)
+                self._touch(peer, status="转人工", unread=0, text=reply)
+                self.emit("inbound", peer=peer, incoming=text, reply=reply, escalated=True)
+                return {"peer": peer, "incoming": text, "reply": reply, "escalated": True}
         self._touch(peer, status="外部消息已回复" if auto else "外部消息草稿",
                     unread=0, text=reply)
         if auto:
@@ -625,14 +734,18 @@ class Agent:
                                    "image": None, "regions": None, "model": model,
                                    "latency_ms": latency, "incoming_items": [text],
                                    "history": history, "profile": profile,
-                                   "tool_results": [r.as_dict() for r in tool_results],
-                                   "is_group": is_group_name(peer), "external": True}
+                                   "tool_results": list(tool_results),
+                                   "is_group": is_group_name(peer), "external": True,
+                                   "event_key": normalize_name(text), "event_seq": 0,
+                                   "signature": normalize_name(text),
+                                   "draft_id": uuid.uuid4().hex, "draft_version": 1,
+                                   "knowledge": evidence.summary(), "evidence": evidence}
             if peer in self._pending_order:
                 self._pending_order.remove(peer)
             self._pending_order.append(peer)
         self.audit.record(peer=peer, action="inbound", status="已回复" if auto else "草稿",
                           incoming=text, reply=reply, model=model, latency_ms=latency,
-                          detail="外部 IM 入站")
+                          detail="外部 IM 入站", evidence=evidence.summary())
         self.emit("inbound", peer=peer, incoming=text, reply=reply, auto=auto,
                   model=model, latency_ms=latency)
         return {"peer": peer, "incoming": text, "reply": reply, "auto": auto,
@@ -970,18 +1083,48 @@ class Agent:
                     last_out = index
             items = [MessageItem(kind="text", text=line.text)
                      for line in chat_lines[last_out + 1:] if line.direction == "in"]
-            media_items = extract_items(image, regions, lines, self.media_dir,
-                                        detect_media=self.vision.available)
+            # 媒体检测和"有没有视觉模型"解耦：没有视觉模型时也要知道对方发了图，
+            # 否则会把一张图当成空气，直接对着文字生成回复。
+            media_items = extract_items(image, regions, lines, self.media_dir, detect_media=True)
             items.extend(item for item in media_items if item.kind != "text")
         for item in items:
             if item.kind == "image":
-                if self.vision.available and item.media_path:
-                    item.description = self.vision.describe(item.media_path)
-                elif not item.description:
-                    item.description = "（未启用视觉模型，无法读图）"
+                self._describe_media(item)
+            elif item.kind in ("voice", "file") and not item.description:
+                item.media_state = item.media_state or "unavailable"
+                item.description = "（未转写）" if item.kind == "voice" else "（未读取）"
                 self.emit("media", media_kind=item.kind, description=item.description,
-                          media_path=item.media_path)
+                          media_path=item.media_path, state=item.media_state)
         return items
+
+    def _describe_media(self, item: MessageItem) -> None:
+        """明确区分：已检测 / 已取得文件 / 理解成功 / 理解失败 / 没有视觉能力。"""
+        if not item.media_path:
+            item.media_state = "detected"
+            item.description = "（检测到图片，但没有取到图片文件）"
+        elif not self.vision.available:
+            item.media_state = "unavailable"
+            item.description = "（未启用视觉模型，无法读图）"
+        else:
+            # 同一张图反复扫描时不重复调用视觉模型（每轮复核都会重新读一次会话）
+            cached = self._vision_cache.get(item.media_path)
+            if cached is None:
+                try:
+                    cached = self.vision.describe(item.media_path)
+                except Exception:
+                    cached = ""
+                if len(self._vision_cache) > 200:
+                    self._vision_cache.clear()
+                self._vision_cache[item.media_path] = cached
+            if cached:
+                item.media_state = "understood"
+                item.description = cached
+            else:
+                item.media_state = "failed"
+                item.description = "（图片内容识别失败）"
+        self.emit("media", media_kind=item.kind, description=item.description,
+                  media_path=item.media_path, state=item.media_state,
+                  understood=item.media_state == "understood")
 
     def _find_avatar_boxes(self, image, regions: Regions) -> List[Tuple[int, int, int, int]]:
         """在会话列表左侧找头像方块（约 36~44px），返回图片全局坐标。"""
@@ -1662,7 +1805,8 @@ class Agent:
             outcome = self.sender.send(peer, pending["reply"], image, regions, guard=guard)
             self._finish_send(peer, pending["reply"], outcome, pending.get("incoming", ""),
                               pending.get("model", ""), pending.get("latency_ms", 0),
-                              pending.get("event_key", ""), int(pending.get("event_seq") or 0))
+                              pending.get("event_key", ""), int(pending.get("event_seq") or 0),
+                              pending.get("knowledge"))
             time.sleep(0.3)      # 多客户公平补发，避免一次把窗口占满
 
     def _make_guard(self, peer: str, signature: str):
@@ -1733,37 +1877,67 @@ class Agent:
             self._mark_event(peer, "done")
             return False
 
-        reply, model, latency, tool_results = None, "", 0, []
-        tool_results = self.tools.prefetch(joined)
-        chunks = self._search_knowledge(joined)
-        # 价格/库存类问题：既没有工具结果、也没有知识依据时，转人工而不是让模型猜
-        if self._needs_evidence(joined) and not any(result.ok for result in tool_results) \
-                and not chunks:
-            self.handoff.take(peer, "没有可靠依据（产品/价格）")
-            self._touch(peer, status="转人工")
-            self.audit.record(peer=peer, action="escalate", status="no_evidence", incoming=joined)
-            self.emit("escalate", peer=peer, reason="没有可靠依据，转人工确认")
-            self._mark_event(peer, "done")
-            return False
+        reply, model, latency = None, "", 0
+        tool_results: List[ToolResult] = []
+        chunks: List[Any] = []
+        evidence = Evidence()
+        verdict = Verdict("ok")
         converged = False
-        # 生成期间客户可能连续补充：最多重生成 2 次；超过仍不一致就挂起，绝不发旧答案
+        # 生成期间客户可能连续补充：最多重生成 2 次；超过仍不一致就挂起，绝不发旧答案。
+        # 每一轮都重新取工具/知识/媒体并**重新判定依据**——追加消息不能绕过依据检查。
         for _round in range(3):
-            if _round > 0:
-                tool_results = self.tools.prefetch(joined)
-                chunks = self._search_knowledge(joined)
+            query, ambiguous = self._context_query(peer, joined, history)
+            tool_results = [ToolResult.coerce(item) for item in self.tools.prefetch(query)]
+            chunks, kb_meta = self._search_knowledge(query)
+            evidence = Evidence(tool_results=tool_results, chunks=chunks,
+                                provider=kb_meta.get("provider", "local"),
+                                kb_version=kb_meta.get("version", ""),
+                                kb_error=kb_meta.get("error", ""))
+            self._remember_product(peer, query, evidence)
             for result in tool_results:
                 self.emit("tool", name=result.name, summary=result.summary, ok=result.ok)
-            reply, model, latency = self._generate(incoming, joined, history, profile,
-                                                   tool_results, is_group, peer=peer,
-                                                   chunks=chunks)
-            if reply is None:
-                self._touch(peer, status="生成失败待重试")
-                state = self._event_state.get(peer)
-                if state is not None:
-                    state["last_error"] = self._last_error
-                self._mark_event(peer, "retry", delay=15.0)
-                self.emit("skip", peer=peer, reason="模型失败，稍后自动重试")
+            verdict = self._media_verdict(peer, items) or evidence_decide(
+                joined, evidence, product_hint=query, ambiguous_product=ambiguous)
+            if verdict.action == "handoff":
+                self.handoff.take(peer, verdict.reason or "没有可靠依据")
+                # 同一批消息的旧草稿也必须作废：否则人工批准还能把"没依据的答案"发出去
+                self._drop_pending(peer)
+                self._touch(peer, status="转人工")
+                self.audit.record(peer=peer, action="escalate",
+                                  status="no_evidence:" + ",".join(verdict.missing),
+                                  incoming=joined, detail=verdict.reason, evidence=evidence.summary())
+                self.emit("escalate", peer=peer, reason=verdict.reason or "没有可靠依据",
+                          missing=verdict.missing, categories=verdict.categories)
+                self._mark_event(peer, "done")
                 return False
+            if verdict.action == "ask":
+                # 追问是固定话术，不含任何事实承诺，也不能被模型改写
+                reply, model, latency = verdict.reply, "rule", 0
+            else:
+                reply, model, latency = self._generate(incoming, joined, history, profile,
+                                                       tool_results, is_group, peer=peer,
+                                                       chunks=chunks)
+                if reply is None:
+                    self._touch(peer, status="生成失败待重试")
+                    state = self._event_state.get(peer)
+                    if state is not None:
+                        state["last_error"] = self._last_error
+                    self._mark_event(peer, "retry", delay=15.0)
+                    self.emit("skip", peer=peer, reason="模型失败，稍后自动重试")
+                    return False
+                unsupported = find_unsupported_claim(reply, evidence.text(), joined)
+                if unsupported:
+                    # 模型自己造了数字（价格/交期/库存）：不发送，转人工核对
+                    reason = f"回复里的「{unsupported}」在依据里找不到"
+                    self.handoff.take(peer, reason)
+                    self._drop_pending(peer)
+                    self._touch(peer, status="转人工")
+                    self.audit.record(peer=peer, action="block", status="unsupported_claim",
+                                      incoming=joined, reply=reply, detail=reason,
+                                      evidence=evidence.summary())
+                    self.emit("escalate", peer=peer, reason=reason, claim=unsupported)
+                    self._mark_event(peer, "done")
+                    return False
             latest = self._latest_incoming(peer)
             if latest is None:
                 converged = True       # 无法复核，交给发送前的 header/输入框检查
@@ -1777,6 +1951,7 @@ class Agent:
             if normalize_name(latest_joined) == signature:
                 converged = True
                 break
+            # 客户补了新消息：整个判定重来（这一轮的答案直接丢掉）
             items = latest
             incoming = [item.prompt_text() for item in items]
             joined = latest_joined
@@ -1809,9 +1984,13 @@ class Agent:
             "peer": peer, "reply": reply, "incoming": joined, "image": image,
             "regions": regions, "model": model, "latency_ms": latency,
             "incoming_items": incoming, "history": history, "profile": profile,
-            "tool_results": [result.as_dict() for result in tool_results], "is_group": is_group,
+            # 工具结果统一存 ToolResult 对象：重新生成时不能再出现 dict/对象混用
+            "tool_results": list(tool_results), "is_group": is_group,
             "event_key": event_key, "event_seq": event_seq, "signature": signature,
-            "draft_id": uuid.uuid4().hex, "version": event_key,
+            "draft_id": uuid.uuid4().hex, "draft_version": 1,
+            "knowledge": evidence.summary(), "evidence": evidence,
+            "verdict": {"action": verdict.action, "categories": verdict.categories,
+                        "missing": verdict.missing},
         }
         if peer in self._pending_order:
             self._pending_order.remove(peer)
@@ -1820,17 +1999,20 @@ class Agent:
         self.audit.record(peer=peer, action="draft",
                           status="dry_run" if self.dry_run else "draft",
                           incoming=joined, reply=reply, model=model,
-                          latency_ms=latency, image=image)
+                          latency_ms=latency, image=image, evidence=evidence.summary())
         self.emit("draft", peer=peer, reply=reply, model=model,
                   latency_ms=latency, dry_run=self.dry_run,
-                  tools=[result.name for result in tool_results])
+                  tools=[result.name for result in tool_results],
+                  draft_id=self._pending[peer]["draft_id"],
+                  draft_version=1, knowledge=evidence.summary())
 
         ok, reason = self.send_gate(peer)
         if not ok:
             # 草稿保留在待发队列，闸门恢复后由 _flush_held 补发
             self._pending[peer]["held_reason"] = reason
             self.audit.record(peer=peer, action="draft", status=f"held_{reason}",
-                              incoming=joined, reply=reply, model=model, latency_ms=latency)
+                              incoming=joined, reply=reply, model=model, latency_ms=latency,
+                              evidence=evidence.summary())
             self.emit("held", peer=peer, reason=reason, reply=reply)
             self._mark_event(peer, "held")
             return True
@@ -1849,7 +2031,7 @@ class Agent:
             self.emit("handoff", peer=peer, reason="输入框有内容，暂停自动发送，请人工处理")
             self._mark_event(peer, "done")
         return self._finish_send(peer, reply, outcome, joined, model, latency,
-                                 event_key, event_seq)
+                                 event_key, event_seq, evidence.summary())
 
     def _latest_incoming(self, peer: str):
         """生成期间复核：当前会话是否还是同一个客户、有没有新消息。
@@ -1867,21 +2049,103 @@ class Agent:
         except Exception:
             return None
 
-    def _search_knowledge(self, query: str) -> List[Any]:
-        """统一检索入口：WeKnora 优先，不可用/无命中时回退本地知识库。"""
+    def _search_knowledge(self, query: str) -> Tuple[List[Any], Dict[str, Any]]:
+        """统一检索入口：WeKnora 优先，不可用/无命中时回退本地知识库。
+
+        返回 (chunks, meta)；meta 里的 provider/version/error 会写进草稿和审计，
+        这样"这条回复用了哪一版知识、哪几个来源"是可追溯的。
+        """
+        meta: Dict[str, Any] = {"provider": "local", "version": self.kb.version, "error": ""}
         client = getattr(self, "weknora", None)
         if client is not None and client.enabled:
             hits = client.search(query, top_k=self.config.rag.top_k)
             if hits:
-                return weknora_chunks(hits)
+                meta.update(provider="weknora",
+                            version=str(self.config.rag.weknora_kb_id
+                                        or ",".join(self.config.rag.weknora_kb_ids) or "remote"),
+                            error="")
+                return weknora_chunks(hits), meta
             if client.last_error:
-                self.emit("error", message=f"WeKnora 检索失败，已回退本地知识库：{client.last_error}")
-        return self.kb.search(query, top_k=self.config.rag.top_k)
+                meta["error"] = client.last_error
+                self.emit("error", message=f"WeKnora 检索失败（{client.last_error}），已回退本地知识库")
+        return self.kb.search(query, top_k=self.config.rag.top_k), meta
 
-    @staticmethod
-    def _needs_evidence(text: str) -> bool:
-        return any(word in (text or "") for word in
-                   ("价", "多少钱", "报价", "价格", "库存", "有货", "现货", "型号", "美金", "usd"))
+    def knowledge_status(self) -> Dict[str, Any]:
+        """控制台展示用：实际在跑哪个后端、有没有回退、OCR 实际后端。"""
+        client = getattr(self, "weknora", None)
+        remote = client is not None and client.enabled
+        return {
+            "provider": "weknora" if remote else "local",
+            "remote_enabled": bool(remote),
+            "remote_error": str(getattr(client, "last_error", "") or ""),
+            "remote_hits": int(getattr(client, "last_count", 0) or 0),
+            "kb_version": self.kb.version,
+            "kb_size": self.kb.size,
+            "ocr_backend": self.ocr.backend_name,
+            "ocr_error": self.ocr.last_error or "",
+            "vision": self.vision.available,
+        }
+
+    # ---------- 上下文 / 媒体（依据判断的配套逻辑） ----------
+    def _context_query(self, peer: str, joined: str, history: List[str]) -> Tuple[str, str]:
+        """多轮指代补全：返回 (检索 query, 歧义追问话术)。
+
+        "这个多少钱" 这类话本身没有型号，直接拿去检索必然查不到；
+        先用本会话最近确认过的型号，再退回历史里出现过的型号。
+        """
+        if has_sku(joined) or self.tools.match_product(joined):
+            return joined, ""
+        if not has_pronoun(joined):
+            return joined, ""
+        ctx = self._product_ctx.get(peer) or {}
+        sku = str(ctx.get("sku") or "").strip()
+        if sku and time.time() - float(ctx.get("ts") or 0) < 3600:
+            return f"{joined} {sku}", ""
+        found: List[str] = []
+        for line in reversed(history or []):
+            for candidate in skus_in(line):
+                upper = candidate.upper()
+                if upper not in found:
+                    found.append(upper)
+            if len(found) > 1:
+                break
+        if len(found) == 1:
+            return f"{joined} {found[0]}", ""
+        if len(found) > 1:
+            return joined, "请问您说的是哪一款？方便发一下型号吗？"
+        return joined, ""
+
+    def _remember_product(self, peer: str, text: str, evidence: Evidence) -> None:
+        """记住本会话确认过的型号，供后续"这个/这款"指代使用。"""
+        for result in evidence.tool_results:
+            data = getattr(result, "data", None)
+            if isinstance(data, dict) and data.get("sku"):
+                self._product_ctx[peer] = {"sku": str(data["sku"]),
+                                           "name": str(data.get("name") or ""),
+                                           "ts": time.time()}
+                return
+        item = self.tools.match_product(text)
+        if item:
+            self._product_ctx[peer] = {"sku": str(item.get("sku") or ""),
+                                       "name": str(item.get("name") or ""),
+                                       "ts": time.time()}
+
+    def _media_verdict(self, peer: str, items: List[MessageItem]) -> Optional[Verdict]:
+        """图片读不出来时的确定出口：先追问一次，同一张图还读不出来就转人工。"""
+        unreadable = [item for item in items if item.kind == "image"
+                      and item.media_state in ("detected", "unavailable", "failed")]
+        if not unreadable:
+            return None
+        asked = self._media_asked.setdefault(peer, set())
+        for item in unreadable:
+            # 有文件路径按路径去重；结构化通道没有路径时退化成"会话内同一张图"
+            key = str(item.media_path or (str(item.bbox) if item.bbox else "image"))
+            if key in asked:
+                return Verdict("handoff", [], [], "图片内容无法确认（已追问过一次）")
+            asked.add(key)
+            return Verdict("ask", [], [], "无法读取图片内容，先追问",
+                           "图片这边看不清，方便用文字说一下型号或需求吗？", "media")
+        return None
 
     # ---------- 生成 ----------
     def _friend_persona(self, peer: str) -> str:
@@ -1891,8 +2155,10 @@ class Agent:
     def _generate(self, incoming: List[str], joined: str, history: List[str],
                   profile: Dict[str, str], tool_results: List[Any], is_group: bool,
                   peer: str = "", chunks: Optional[List[Any]] = None) -> Tuple[Optional[str], str, int]:
+        # 工具结果可能有 dict / 对象两种历史形态：统一还原，避免重新生成时崩
+        tool_results = [ToolResult.coerce(item) for item in (tool_results or [])]
         if chunks is None:
-            chunks = self._search_knowledge(joined)
+            chunks = self._search_knowledge(joined)[0]
         system = build_system_prompt(self.persona, chunks, profile)
         if profile.get("summary"):
             system += f"\n【历史摘要】{profile['summary']}"
@@ -1961,14 +2227,16 @@ class Agent:
 
     # ---------- 发送结果 ----------
     def _finish_send(self, peer: str, reply: str, outcome, joined: str,
-                     model: str, latency: int, signature: str, event_seq: int = 0) -> bool:
+                     model: str, latency: int, signature: str, event_seq: int = 0,
+                     knowledge: Optional[Dict[str, Any]] = None) -> bool:
         status = outcome.outcome.status
         detail = outcome.outcome.detail
         self.audit.record(peer=peer, action="send", status=status,
                           incoming=joined, reply=reply, detail=detail,
-                          model=model, latency_ms=latency)
+                          model=model, latency_ms=latency, evidence=knowledge)
         try:
-            self.audit.record_send(peer, signature, reply, status, detail, event=event_seq)
+            self.audit.record_send(peer, signature, reply, status, detail, event=event_seq,
+                                   knowledge=knowledge)
         except Exception:
             pass
         if status == "verified":
@@ -2350,13 +2618,15 @@ class Agent:
 
     def approve_pending(self, text_override: Optional[str] = None,
                         peer: Optional[str] = None,
-                        draft_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                        draft_id: Optional[str] = None,
+                        event_seq: Optional[int] = None) -> Optional[Dict[str, Any]]:
         with self.wx_lock:
-            return self._approve_pending_locked(text_override, peer, draft_id)
+            return self._approve_pending_locked(text_override, peer, draft_id, event_seq)
 
     def _approve_pending_locked(self, text_override: Optional[str] = None,
                                 peer: Optional[str] = None,
-                                draft_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                                draft_id: Optional[str] = None,
+                                event_seq: Optional[int] = None) -> Optional[Dict[str, Any]]:
         # 发送必须绑定到明确联系人：不再"没找到就回退到别人的草稿"
         if not peer:
             return {"ok": False, "status": "blocked",
@@ -2365,10 +2635,23 @@ class Agent:
         if not pending:
             return {"ok": False, "status": "blocked",
                     "detail": f"「{peer}」没有待发送草稿，拒绝跨会话发送", "peer": peer}
-        # 草稿 ID 绑定：前端拿着旧草稿（或别的会话的草稿）来发，一律拒绝
-        if draft_id and pending.get("draft_id") and draft_id != pending.get("draft_id"):
+        # 草稿版本闭合：必须带上当前版本号，缺失/过期/别的会话一律拒绝
+        current_id = str(pending.get("draft_id") or "")
+        if not str(draft_id or "").strip():
+            return {"ok": False, "status": "blocked",
+                    "detail": "缺少草稿版本号（draft_id），请刷新控制台后重试",
+                    "peer": peer}
+        if str(draft_id) != current_id:
             return {"ok": False, "status": "stale",
                     "detail": "草稿已更新，请刷新后重新确认", "peer": peer}
+        if event_seq:
+            try:
+                if int(event_seq) != int(pending.get("event_seq") or 0):
+                    return {"ok": False, "status": "stale",
+                            "detail": "消息批次已过期，草稿作废", "peer": peer}
+            except (TypeError, ValueError):
+                return {"ok": False, "status": "blocked",
+                        "detail": "event_seq 不合法", "peer": peer}
         reply = (text_override or "").strip() or pending["reply"]
         checked = self.guardrails.check_reply(reply)
         if checked.action != "reply":
@@ -2381,7 +2664,7 @@ class Agent:
         # 模拟会话：只走项目内的"发送"，不碰真实微信
         if peer.startswith("【模拟】"):
             self.audit.record_send(peer, event_key, pending["reply"], "verified", "simulated",
-                                   event=event_seq)
+                                   event=event_seq, knowledge=pending.get("knowledge"))
             self.memory.add(peer, "out", "text", pending["reply"])
             self._touch(peer, status="模拟已回复", text=pending["reply"])
             self._drop_pending(peer)
@@ -2441,7 +2724,7 @@ class Agent:
                                    pending["regions"], guard=guard)
         ok = self._finish_send(peer, pending["reply"], outcome, pending.get("incoming", ""),
                                pending.get("model", ""), pending.get("latency_ms", 0),
-                               event_key, event_seq)
+                               event_key, event_seq, pending.get("knowledge"))
         return {"ok": ok, "status": outcome.outcome.status, "detail": outcome.outcome.detail,
                 "peer": peer, "reply": pending["reply"]}
 
@@ -2467,25 +2750,58 @@ class Agent:
                 self._pending_order.remove(target["peer"])
         self.emit("status", message="已丢弃当前草稿")
 
-    def regenerate_pending(self, peer: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        pending = self._resolve_pending(peer)
-        if not pending:
-            return None
-        reply, model, latency = self._generate(
-            pending.get("incoming_items") or [pending.get("incoming", "")],
-            pending.get("incoming", ""),
-            pending.get("history") or [],
-            pending.get("profile") or {},
-            pending.get("tool_results") or [],
-            pending.get("is_group", False),
-            peer=pending.get("peer", ""),
-        )
-        if reply is None:
-            return None
-        pending.update({"reply": reply, "model": model, "latency_ms": latency})
-        self.emit("draft", peer=pending["peer"], reply=reply, model=model,
-                  latency_ms=latency, dry_run=self.dry_run, regenerated=True)
-        return {"reply": reply, "peer": pending["peer"]}
+    def regenerate_pending(self, peer: Optional[str] = None,
+                           draft_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """重新生成草稿：必须换新版本号，旧版本立刻作废。"""
+        with self.wx_lock:
+            pending = self._resolve_pending(peer)
+            if not pending:
+                return None
+            current_id = str(pending.get("draft_id") or "")
+            if draft_id and current_id and str(draft_id) != current_id:
+                return {"ok": False, "status": "stale",
+                        "detail": "草稿已更新，请刷新后重新生成", "peer": pending.get("peer")}
+            # 客户又发了新消息：旧上下文重生成出来的答案已经对不上，直接作废
+            target = pending.get("peer") or ""
+            if target and not pending.get("simulated") and not pending.get("external"):
+                latest = self._latest_incoming(target)
+                if latest is not None:
+                    latest_joined = " / ".join(item.prompt_text() for item in latest)
+                    if not latest or normalize_name(latest_joined) != pending.get("signature", ""):
+                        return {"ok": False, "status": "stale",
+                                "detail": "客户已有新消息，草稿已过期，请等待重新生成",
+                                "peer": target}
+            tool_results = [ToolResult.coerce(item) for item in (pending.get("tool_results") or [])]
+            reply, model, latency = self._generate(
+                pending.get("incoming_items") or [pending.get("incoming", "")],
+                pending.get("incoming", ""),
+                pending.get("history") or [],
+                pending.get("profile") or {},
+                tool_results,
+                pending.get("is_group", False),
+                peer=target,
+            )
+            if reply is None:
+                return None
+            evidence = pending.get("evidence") or Evidence(tool_results=tool_results)
+            unsupported = find_unsupported_claim(reply, evidence.text() if isinstance(evidence, Evidence) else "",
+                                                 pending.get("incoming", ""))
+            if unsupported:
+                return {"ok": False, "status": "blocked",
+                        "detail": f"新草稿里的「{unsupported}」没有依据，请转人工确认",
+                        "peer": target}
+            pending.update({"reply": reply, "model": model, "latency_ms": latency,
+                            "draft_id": uuid.uuid4().hex})
+            pending["draft_version"] = int(pending.get("draft_version") or 1) + 1
+            self.audit.record(peer=target, action="draft", status="regenerated",
+                              incoming=pending.get("incoming", ""), reply=reply, model=model,
+                              latency_ms=latency, evidence=pending.get("knowledge"))
+            self.emit("draft", peer=target, reply=reply, model=model,
+                      latency_ms=latency, dry_run=self.dry_run, regenerated=True,
+                      draft_id=pending["draft_id"], draft_version=pending["draft_version"],
+                      knowledge=pending.get("knowledge"))
+            return {"ok": True, "reply": reply, "peer": target,
+                    "draft_id": pending["draft_id"], "draft_version": pending["draft_version"]}
 
     def send_manual(self, peer: str, text: str) -> Optional[Dict[str, Any]]:
         with self.wx_lock:

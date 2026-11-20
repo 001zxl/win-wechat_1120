@@ -14,6 +14,15 @@ if errorlevel 1 (
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 echo.
+echo === 示例报价表 ===
+if not exist data mkdir data
+if not exist data\price_list.json (
+  copy /y price_list.example.json data\price_list.json >nul
+  echo 已复制示例报价表到 data\price_list.json —— 正式使用前请替换成真实价格
+) else (
+  echo data\price_list.json 已存在，保留不动
+)
+echo.
 echo === 环境自检 ===
 python run.py doctor
 echo.

@@ -306,7 +306,7 @@
 <div class="modal-mask" id="settingsModal">
   <div class="modal-card">
     <h2>模型与 Key</h2>
-    <div class="hint">每个模型可填独立 API Key；留空表示沿用默认 ai.api_key。Key 只保存在本机 data/settings.json。</div>
+    <div class="hint">每个模型可填独立 API Key。留空<b>不会</b>沿用默认 ai.api_key：留空或点「删除」就是撤销这个 Key，保存后立即失效。Key 只保存在本机 data/settings.json。</div>
     <div id="keyRows"></div>
     <div class="key-row" style="margin-top:14px">
       <label>视觉模型（图片理解）</label>
@@ -316,9 +316,12 @@
       <label>Embedding 模型（向量 RAG）</label>
       <input id="embeddingModel" placeholder="如 text-embedding-3-small / bge-m3" />
     </div>
-    <div class="modal-actions">
-      <button id="settingsCancel">取消</button>
-      <button class="primary" id="settingsSave">保存并应用</button>
+    <div class="modal-actions" style="justify-content:space-between">
+      <button id="revokeAll" title="删除所有已保存的模型/视觉/Embedding Key，并让控制台令牌立即失效">撤销全部凭据</button>
+      <div>
+        <button id="settingsCancel">取消</button>
+        <button class="primary" id="settingsSave">保存并应用</button>
+      </div>
     </div>
   </div>
 </div>
@@ -366,12 +369,13 @@ function renderChips(s) {
     s.dry_run ? chip("dry-run 仅草稿", "warn") : chip("真实发送", "on"),
   s.readonly ? chip("只读 · 不操作微信", "off") : "",
 
-    s.ocr ? chip("OCR 就绪", "on") : chip("OCR 未装", "warn"),
+    s.ocr ? chip(`OCR ${s.ocr_backend || "就绪"}`, "on") : chip("OCR 未装", "warn"),
     s.vision ? chip("视觉就绪", "on") : chip("视觉未配", "warn"),
     chip(`工具 ${s.tools ? "开" : "关"}`),
     s.group ? chip("群聊放行", "on") : chip("群聊关闭", ""),
     chip(`人设 ${s.persona}`),
-    chip(`知识库 ${s.kb} 块 · v${s.kb_version || "-"}`),
+    chip(`知识库 ${s.kb} 块 · ${s.kb_provider === "weknora" ? "WeKnora" : "本地"} · v${s.kb_version || "-"}`),
+    s.kb_remote_error ? chip("远端检索回退本地", "warn") : "",
     chip(`白名单 ${s.whitelist}`),
   ];
   $("chips").innerHTML = parts.join("");
@@ -400,6 +404,8 @@ function renderChips(s) {
     `记忆：${s.memory || "data/memory.db"}`,
     `工具：${s.tools ? "已启用（报价/库存）" : "关闭"}`,
     `视觉：${s.vision ? "已配置" : "未配置"}`,
+    `OCR：${s.ocr ? (s.ocr_backend || "就绪") : "未装"}`,
+    `知识后端：${s.kb_provider === "weknora" ? "WeKnora" : "本地 BM25"}${s.kb_remote_error ? "（远端失败已回退）" : ""}`,
   ].join("  ·  ");
 }
 
@@ -499,7 +505,19 @@ function renderDraft() {
   if (mine && key !== draftKey) {
     $("draft").value = pending.reply;
     draftKey = key;
-    $("draftMeta").textContent = `${pending.model} · ${pending.latency_ms}ms`;
+    const knowledge = pending.knowledge || {};
+    const sources = (knowledge.sources || [])
+      .map((item) => item.source || item.title || "片段")
+      .filter(Boolean);
+    const bits = [
+      `${pending.model} · ${pending.latency_ms}ms`,
+      `v${pending.draft_version || 1}`,
+      pending.verdict && pending.verdict.action === "ask" ? "固定追问（无事实承诺）" : "",
+      knowledge.provider ? `依据 ${knowledge.provider === "weknora" ? "WeKnora" : "本地"}${knowledge.kb_version ? " " + knowledge.kb_version : ""}` : "",
+      sources.length ? "来源：" + sources.slice(0, 3).join("、") : "无外部来源",
+    ].filter(Boolean);
+    $("draftMeta").textContent = bits.join(" · ");
+    $("draftMeta").title = JSON.stringify(knowledge, null, 2);
   }
   if (!mine) {
     // 没有当前客户的草稿：清空编辑器，别让上一位客户的内容留在框里
@@ -640,11 +658,22 @@ function addWhitelist() {
 function openSettings() {
   const models = (state && state.status.models) || [];
   $("keyRows").innerHTML = models.map((m) => `
-    <div class="key-row">
+    <div class="key-row" data-row="${escapeAttr(m.id)}">
       <label>${escapeHtml(m.label)}</label>
-      <input type="password" data-model="${escapeAttr(m.id)}" placeholder="${m.has_key ? "已配置，留空则不修改" : "未配置，请输入 API Key"}" />
+      <input type="password" data-model="${escapeAttr(m.id)}" placeholder="${m.has_key ? "已配置，留空=删除该 Key" : "未配置，请输入 API Key"}" />
       <span class="state ${m.has_key ? "ok" : ""}">${m.has_key ? "已配置" : "缺 Key"}</span>
+      <button type="button" data-delete="${escapeAttr(m.id)}" ${m.has_key ? "" : "disabled"}>删除</button>
     </div>`).join("");
+  $("keyRows").querySelectorAll("button[data-delete]").forEach((btn) => {
+    btn.onclick = async () => {
+      const modelId = btn.dataset.delete;
+      if (!confirm(`删除「${modelId}」的 Key？删除后该模型立即变为未就绪。`)) return;
+      const result = await act("api_keys", { delete: [modelId] });
+      if (!result || !result.ok) alert("删除失败");
+      await fetchState();
+      openSettings();
+    };
+  });
   $("visionModel").value = (state && state.status.vision_model) || "";
   $("embeddingModel").value = (state && state.status.embedding_model) || "";
   $("settingsModal").classList.add("open");
@@ -652,15 +681,22 @@ function openSettings() {
 
 async function saveSettings() {
   const keys = {};
+  const removed = [];
   document.querySelectorAll("#keyRows input[data-model]").forEach((input) => {
-    if ((input.value || "").trim()) keys[input.dataset.model] = input.value.trim();
+    const value = (input.value || "").trim();
+    const had = $(`#keyRows .key-row[data-row="${CSS.escape(input.dataset.model)}"] .state.ok`);
+    if (value) keys[input.dataset.model] = value;
+    else if (had) removed.push(input.dataset.model);   // 清空已配置的 Key = 明确删除
   });
-  if (Object.keys(keys).length) await act("api_keys", { keys });
+  if (Object.keys(keys).length || removed.length) {
+    await act("api_keys", { keys, delete: removed });
+  }
   await act("models", {
     vision_model: $("visionModel").value.trim(),
     embedding_model: $("embeddingModel").value.trim(),
   });
   $("settingsModal").classList.remove("open");
+  await fetchState();
 }
 
 // ---------- 校准布局 ----------
@@ -952,6 +988,14 @@ $("presetSaved").onclick = () => {
 $("btnSettings").onclick = openSettings;
 $("settingsCancel").onclick = () => $("settingsModal").classList.remove("open");
 $("settingsSave").onclick = saveSettings;
+$("revokeAll").onclick = async () => {
+  if (!confirm("撤销全部凭据？会删除本机保存的所有模型/视觉/Embedding Key，并让控制台访问令牌立即失效（需重启并配置新令牌）。")) return;
+  const result = await act("revoke_credentials", { targets: ["all"] });
+  if (!result || !result.ok) { alert("撤销失败"); return; }
+  alert("已撤销：" + ((result.revoked || []).join("、") || "全部"));
+  $("settingsModal").classList.remove("open");
+  await fetchState();
+};
 $("btnCalibrate").onclick = openCalibrate;
 $("calCancel").onclick = () => $("calibrateModal").classList.remove("open");
 $("calRefresh").onclick = refreshCalibrate;
@@ -963,10 +1007,15 @@ $("pause").onclick = () => act("pause", { paused: !(state && state.status.paused
 $("live").onchange = (event) => act("live", { live: event.target.checked });
 $("send").onclick = async () => {
   const pending = (state && state.pending && state.pending.peer === selected) ? state.pending : null;
+  if (!pending || !pending.draft_id) {
+    alert("没有当前客户的草稿版本，请先在左栏选中对应会话并等待草稿生成");
+    return;
+  }
   const result = await act("approve", {
     text: $("draft").value,
     peer: selected,
-    draft_id: pending ? pending.draft_id : "",
+    draft_id: pending.draft_id,
+    event_seq: pending.event_seq || 0,
   });
   const info = result && result.result;
   if (!result || !result.ok) {
@@ -974,8 +1023,17 @@ $("send").onclick = async () => {
   } else if (info) {
     alert("已发送（" + info.status + "）：" + (info.reply || "").slice(0, 40));
   }
+  await fetchState();
 };
-$("regen").onclick = () => act("regen");
+$("regen").onclick = async () => {
+  const pending = (state && state.pending && state.pending.peer === selected) ? state.pending : null;
+  const result = await act("regen", { draft_id: pending ? pending.draft_id : "" });
+  if (!result || !result.ok) {
+    const info = result && result.result;
+    alert("重新生成失败：" + ((info && (info.detail || info.status)) || "没有草稿或客户已有新消息"));
+  }
+  await fetchState();
+};
 $("discard").onclick = () => act("discard");
 $("stopSend").onclick = async () => {
   const result = await act("stop");

@@ -77,9 +77,11 @@ def cmd_doctor(args) -> int:
     ocr = OcrEngine()
     print(f"OCR={'可用' if ocr.available else '不可用：' + str(ocr.load_error)}")
 
-    from wxreply.brain.llm import LLMClient
+    from wxreply.brain.llm import LLMClient, ModelRouter
 
-    llm = LLMClient(cfg.ai)
+    # 用路由解析后的凭据判断就绪：控制台里填的按模型 key 也算数
+    router = ModelRouter(cfg.ai, dry_run=cfg.runtime.dry_run)
+    llm = LLMClient(router.client.config)
     print(f"模型={cfg.ai.model} base={cfg.ai.base_url} ready={llm.ready} dry_run={cfg.runtime.dry_run}")
 
     layout = LayoutCalculator(

@@ -29,15 +29,65 @@ class SettingsStore:
 
     # ---------- API Key ----------
     def set_api_keys(self, keys: Dict[str, str]) -> None:
+        """写入/删除模型 Key。空字符串 = 明确删除（不是"不修改"）。"""
         current = dict(self.data.get("api_keys") or {})
+        revoked = [str(item) for item in (self.data.get("revoked") or []) if str(item).strip()]
         for model_id, key in keys.items():
             if key is None:
                 continue
-            current[str(model_id)] = str(key).strip()
-        self.data["api_keys"] = {k: v for k, v in current.items() if v}
+            model_id = str(model_id)
+            if str(key).strip():
+                current[model_id] = str(key).strip()
+                revoked = [item for item in revoked if item.lower() != model_id.lower()]
+            else:
+                current.pop(model_id, None)
+                if model_id.lower() not in {item.lower() for item in revoked}:
+                    revoked.append(model_id)
+        self.data["api_keys"] = current
+        self.data["revoked"] = revoked
+
+    def revoke(self, names: List[str]) -> List[str]:
+        """显式撤销：删掉持久化的 key 并记下"已撤销"，防止从顶层配置继承回来。
+
+        "*" 会展开成"当前所有已保存的模型 key + 顶层/视觉/Embedding"，
+        这样用户之后重新录入某个模型的 key 仍然有效，不会被一个通配符永久锁死。
+        """
+        current = dict(self.data.get("api_keys") or {})
+        revoked = {str(item).strip().lower(): str(item).strip()
+                   for item in (self.data.get("revoked") or []) if str(item).strip()}
+        for name in names or []:
+            token = str(name or "").strip()
+            if not token:
+                continue
+            if token == "*":
+                expanded = list(current.keys()) + ["default", "vision", "embedding"]
+                for item in expanded:
+                    revoked[item.lower()] = item
+                current = {}
+                continue
+            revoked[token.lower()] = token
+            current = {key: value for key, value in current.items()
+                       if key.strip().lower() != token.lower()}
+        self.data["api_keys"] = current
+        self.data["revoked"] = sorted(revoked.values())
+        return list(self.data["revoked"])
+
+    def restore(self, names: List[str]) -> List[str]:
+        """解除撤销标记（重新录入 key 时调用）。"""
+        drop = {str(name or "").strip().lower() for name in names or [] if str(name).strip()}
+        if "*" in drop:
+            remaining: List[str] = []
+        else:
+            remaining = [str(item) for item in (self.data.get("revoked") or [])
+                         if str(item).strip().lower() not in drop]
+        self.data["revoked"] = remaining
+        return remaining
 
     def api_keys(self) -> Dict[str, str]:
         return dict(self.data.get("api_keys") or {})
+
+    def revoked(self) -> List[str]:
+        return [str(item) for item in (self.data.get("revoked") or []) if str(item).strip()]
 
     # ---------- 白名单 ----------
     def set_whitelist(self, names: List[str]) -> None:

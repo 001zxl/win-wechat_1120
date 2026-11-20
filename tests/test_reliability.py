@@ -337,7 +337,8 @@ class TestStaleDraft(unittest.TestCase):
             agent._respond("张三", items, image, regions, False)
 
             platform.sessions[0].messages.append({"dir": "in", "kind": "text", "text": "改成三个"})
-            result = agent.approve_pending(peer="张三")
+            result = agent.approve_pending(peer="张三",
+                                           draft_id=agent._pending["张三"]["draft_id"])
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "stale")
             self.assertNotIn("张三", agent._pending)
@@ -638,7 +639,8 @@ class TestApproveWithOtherChatOpen(unittest.TestCase):
                 return True
 
             agent.open_conversation = fake_open
-            result = agent.approve_pending(peer="张三")
+            result = agent.approve_pending(peer="张三",
+                                           draft_id=agent._pending["张三"]["draft_id"])
             self.assertNotEqual(result["status"], "blocked", result)
             self.assertEqual(result["status"], "verified", result)
             agent.close()

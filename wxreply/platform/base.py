@@ -34,6 +34,7 @@ class MessageItem:
     mention: bool = False        # 是否 @我 / @所有人
     media_path: str = ""         # 图片裁图临时文件
     description: str = ""        # 视觉模型 / 占位描述
+    media_state: str = ""        # 媒体处理状态：detected | saved | understood | failed | unavailable
     bbox: tuple = ()             # 图片在整窗中的坐标 (x1, y1, x2, y2)
 
     def prompt_text(self) -> str:
